@@ -138,7 +138,10 @@ Press a
 - [x] **3.5 Run `cargo clippy --all-targets --all-features -- -D warnings`.** Clean. Required fixing 8 pre-existing lints (7 `collapsible_if` → edition-2024 let-chains, 1 `print_literal`) that upstream had left failing.
 - [x] **3.6 Run `cargo test`.** **78 passed, 0 failed** — the original 36, plus 25 from Phase 1–2, plus 12 for the live-session guard, plus 5 for symlinked config content.
 - [x] **3.7 Manual smoke: Linux.** Different-account Login verified end-to-end 2026-07-29 (see "Second account, measured"). Copy, cancellation, same-account reporting, and relaunch remain covered by tests.
-- [ ] **3.8 Cross-platform smoke before release.** Verify macOS Keychain and Windows Credential Manager behavior on their native platforms.
+- [ ] **3.8 Cross-platform smoke before release.** Verify macOS Keychain and Windows Credential Manager behavior on their native platforms. **Deliberately left open for the upstream PR** (decision 2026-07-29) — this fork is developed on Linux only, and reviewers on macOS and Windows can exercise the platform paths far better than a simulation here could. Not a gap to close before opening the PR; it is *why* the PR is the right place to close it. What needs exercising:
+  - macOS Keychain and Windows Credential Manager credential handling (the original scope).
+  - `symlink_to`'s Windows fallback. Windows refuses to create symlinks without Developer Mode or elevation, so it copies the target instead. Never run on real Windows.
+  - The live-session guard is pure `fs::metadata` and needs no platform-specific work, but whether its *warning* reads usefully on Windows is untested.
 - [x] **3.9 Add a changelog/release note** describing the behavior change without implying that profile names select Claude identities. `CHANGELOG.md`, Keep a Changelog format, `[Unreleased]`. Opens by stating that a profile is a config environment and its name is a local label, then frames each entry as a consequence of that. The browser-session caveat, the read-only email, the project-vs-user skills boundary, and the non-transferring MCP grants are recorded under Notes so they are not rediscovered as bugs.
 
 ---
@@ -170,6 +173,7 @@ Press a
 - **2026-07-29 — the in-use window is 30 minutes, deliberately generous.** Measured: an actively-typing session rewrites its markers within ~15 s, but an open-and-idle one goes minutes between writes (`personal` measured at 186 s while sitting at a live prompt). A tight window would call that idle. A false positive costs one line in a dialog; a false negative costs an account.
 - **2026-07-29 — symlinked config content stays linked.** A link in `~/.claude` is recreated as a link in the profile, not dereferenced into a copy. Linking a skill out of a repository is done *so that* edits propagate; copying would freeze a stale duplicate per profile and quietly break that. The cost is that a profile depends on the source path continuing to exist, which is already true of the original.
 - **2026-07-29 — relative link targets are absolutized.** They resolve against the link's own directory, and a profile lives somewhere else, so a verbatim copy would point at nothing — silently, which is the dangerous part. A dangling source link is still reproduced as a dangling link rather than failing the copy: that is the user's existing state, and refusing to create the profile over it would be worse.
+- **2026-07-29 — cross-platform verification (3.8) is deferred to the upstream PR, not to a later session here.** This fork is developed on Linux only. Reviewers running macOS and Windows can exercise Keychain, Credential Manager, and the Windows symlink fallback natively, which no amount of local work substitutes for. Recorded as a deliberate choice so a future session does not read the open checkbox as an oversight and try to fake it with mocks.
 - **2026-07-29 — the in-use warning advises, it does not block.** mtime cannot distinguish "open in another terminal" from "closed five minutes ago", so `y` keeps its meaning and the user decides. Blocking on a heuristic would make the tool wrong in a way the user cannot override.
 
 ## Open questions — resolved 2026-07-29
@@ -195,13 +199,12 @@ The workspace's 93 skill symlinks live at `ai-synthesizer/.claude/skills/`. They
 
 ## ▶ Next session — start here
 
-**3.8 is the only Phase 3 item left, and it cannot be done from Linux.** Everything else is closed.
+**Phase 3 is closed except 3.8, which is intentionally staying open for the upstream PR.** Nothing here blocks opening it.
 
-1. **3.8 — cross-platform smoke on macOS and Windows.** Three fork-specific things to exercise, none of which unit tests can prove:
-   - macOS Keychain and Windows Credential Manager credential handling (the original scope).
-   - `symlink_to`'s Windows fallback. Windows refuses to create symlinks without Developer Mode or elevation, so it copies the target instead. Never run on a real Windows box.
-   - The live-session guard is pure `fs::metadata` and needs no platform work, but whether its *warning* is useful on Windows is untested.
-2. **Version and release.** `Cargo.toml` is still `0.1.0` and `CHANGELOG.md` is `[Unreleased]`. Note that the branch tracks `upstream/main` (Abhishek21k), **not** `origin/main` — a bare `git push` aims at the wrong repository, so name the remote until that is fixed.
+1. **Open the upstream PR** against `Abhishek21k/claude-switch` from `juansilvadesign/claude-switch@fix/warm-login`. The branch already tracks `upstream/main`, which is the right base for that comparison — the only consequence is that a bare `git push` aims at a repository this fork cannot write to, so keep naming `origin`.
+   - Carry 3.8 into the PR description as an explicit request: macOS Keychain, Windows Credential Manager, and the Windows symlink fallback all need a reviewer on that platform.
+   - `CHANGELOG.md` `[Unreleased]` is written to be readable as PR notes; it already states the browser-session caveat and the warm-state boundaries a reviewer would otherwise file as bugs.
+2. **Version and release**, once the PR direction is known. `Cargo.toml` is still `0.1.0` and the changelog is `[Unreleased]`. Whether this ships as a fork release or lands upstream changes what the version should say, so it is deliberately undecided.
 
 **Resolved 2026-07-29 — the two mislabelled commits.** `6603736` and `bb803ed` claimed "cwd-aware profile switching and path mapping", a feature that does not exist here; they actually held the live-session guard and the symlink fix. Rewritten as four commits that say what they contain — guard, symlink fix, `cargo fmt`, docs — and force-pushed. The split was verified by diffing the reconstructed pre-`fmt` tree against the original commit: byte-identical, nothing lost. `backup-before-reword` still points at the old `bb803ed`; delete it once you are satisfied.
 
