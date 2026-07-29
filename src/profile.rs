@@ -203,10 +203,21 @@ impl ProfileManager {
         std::process::exit(status.code().unwrap_or(0));
     }
 
-    /// Create an empty profile directory and launch Claude into it.
-    /// Claude will detect no credentials and trigger its own login flow.
-    /// After the user authenticates and exits Claude, we read the email
-    /// from whatever config Claude wrote and register the profile.
+    /// Create a profile for a *different* account, pre-seeded with the current
+    /// account's warm state, then launch Claude so the user can log in.
+    ///
+    /// An empty profile dir is a blank Claude Code: every project MCP server
+    /// drops back to "pending approval", per-directory trust is gone, and
+    /// skills/settings are missing — because `CLAUDE_CONFIG_DIR` relocates
+    /// `.claude.json` too, not just credentials. So the warm parts of
+    /// `~/.claude` are copied first (minus transcripts and prompt history, see
+    /// [`SEED_SKIP`]), and everything identifying the *old* account is then
+    /// removed so Claude runs its normal login flow.
+    ///
+    /// Safety property: the credential file is always removed. Even if a future
+    /// Claude version introduces an identity key this code does not know about,
+    /// the profile still cannot authenticate as the old account — Claude has to
+    /// re-authenticate and overwrites the stale metadata itself.
     pub fn login_profile(&self, name: &str) -> Result<()> {
         let profile_dir = self.profiles_dir.join(name);
         if profile_dir.exists() {
@@ -216,7 +227,12 @@ impl ProfileManager {
             }
         }
         fs::create_dir_all(&profile_dir)?;
+        let seeded = self.seed_profile_dir(&profile_dir)?;
 
+        if seeded {
+            println!("Seeded '{}' from your current setup (settings, skills, project trust).", name);
+            println!("Conversation history and session transcripts were not copied.\n");
+        }
         println!("Launching Claude Code — please log in with the account for profile '{}'.", name);
         println!("After logging in, exit Claude (Ctrl-C or /exit) to finish setup.\n");
 
@@ -306,9 +322,42 @@ impl ProfileManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    /// Copy the warm half of the live `~/.claude` setup into a fresh profile
+    /// dir, then strip everything account-specific so Claude prompts for login.
+    ///
+    /// Returns `false` without copying anything when there is no live
+    /// `~/.claude` to seed from — a first-ever login is still a clean
+    /// empty-directory login.
+    fn seed_profile_dir(&self, profile_dir: &Path) -> Result<bool> {
+        let Some(home) = dirs::home_dir() else {
+            return Ok(false);
+        };
+        let src = home.join(".claude");
+        if !src.exists() {
+            return Ok(false);
+        }
+
+        copy_dir_all_filtered(&src, profile_dir, SEED_SKIP)?;
+
+        // Account metadata lives at the home root, not inside ~/.claude.
+        let home_claude_json = home.join(".claude.json");
+        if home_claude_json.exists() {
+            fs::copy(&home_claude_json, profile_dir.join(".claude.json"))?;
+        }
+
+        // Force a fresh login: no credentials, no stale identity.
+        let creds = profile_dir.join(".credentials.json");
+        if creds.exists() {
+            fs::remove_file(&creds)?;
+        }
+        sanitize_claude_json(&profile_dir.join(".claude.json"))?;
+
+        Ok(true)
+    }
+
     fn copy_and_build_profile(&self, name: &str, src: &Path) -> Result<Profile> {
         let dest = self.profiles_dir.join(name);
-        copy_dir_all(src, &dest)?;
+        copy_dir_all_filtered(src, &dest, SEED_SKIP)?;
         let email = read_email_from_dir(&dest);
         Ok(Profile { name: name.to_string(), email, added: Utc::now(), last_used: None })
     }
@@ -347,17 +396,107 @@ pub fn detect_current_account() -> Option<DetectedAccount> {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+/// Top-level entries inside a Claude config dir that are never copied into a
+/// profile.
+///
+/// Two independent reasons, both load-bearing:
+///
+/// - **Privacy.** `projects/` holds full session transcripts and `history.jsonl`
+///   holds every prompt ever typed. Copying them puts one account's
+///   conversations inside another account's profile — the exact separation a
+///   profile exists to create.
+/// - **Size.** Transcripts and file-history dominate a real config dir (187 MB
+///   of 198 MB on the machine this was developed against), and none of it is
+///   state Claude needs in order to start warm.
+///
+/// Note the name collision this list does *not* touch: the `projects` **key**
+/// inside `.claude.json` carries per-directory trust and MCP-server approvals
+/// and is deliberately preserved. Only the `projects/` **directory** — the
+/// transcripts — is skipped.
+const SEED_SKIP: &[&str] = &[
+    "projects",      // session transcripts (NOT the .claude.json "projects" key)
+    "history.jsonl", // every prompt ever typed
+    "file-history",
+    "sessions",
+    "session-env",
+    "shell-snapshots",
+    "paste-cache",
+    "todos",
+    "tasks",
+    "jobs",
+    "daemon",
+    "daemon.log",
+    "backups",
+    "telemetry",
+    "cache",
+    "ide",
+    "statsig",
+];
+
+/// Keys stripped from a seeded `.claude.json` when the profile is going to hold
+/// a *different* account.
+///
+/// `projects` is deliberately absent — it holds the per-directory trust and MCP
+/// approvals that are the entire reason to seed a profile instead of starting
+/// empty.
+const IDENTITY_KEYS: &[&str] = &[
+    "oauthAccount",             // email, org, account uuid, billing type
+    "userID",                   // per-account analytics id; Claude regenerates it
+    "orgModelDefaultCache",     // org-scoped
+    "penguinModeOrgEnabled",    // org-scoped
+    "claudeAiMcpEverConnected", // account-bound connector list
+    "cachedUsageUtilization",
+    "cachedExtraUsageDisabledReason",
+    "modelAccessCache",
+    "additionalModelCostsCache",
+    "additionalModelOptionsCache",
+];
+
+/// Recursive copy that skips a set of **top-level** entry names.
+///
+/// Pass an empty `skip_top_level` for a plain full copy.
+///
+/// The filter is intentionally shallow: the names in [`SEED_SKIP`] are all
+/// top-level entries of a Claude config dir, and matching at every depth would
+/// silently drop a user's own directory that happened to share a name (a
+/// project literally called `cache/`, for instance).
+///
+/// `fs::copy` carries the source permission bits across, so `.credentials.json`
+/// keeps its `0600` mode rather than landing world-readable.
+fn copy_dir_all_filtered(src: &Path, dst: &Path, skip_top_level: &[&str]) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let dest_path = dst.join(entry.file_name());
+        let name = entry.file_name();
+        if skip_top_level.iter().any(|s| name == *s) {
+            continue;
+        }
+        let dest_path = dst.join(&name);
         if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &dest_path)?;
+            copy_dir_all_filtered(&entry.path(), &dest_path, &[])?;
         } else {
             fs::copy(entry.path(), dest_path)?;
         }
     }
+    Ok(())
+}
+
+/// Remove the keys that identify a specific Claude account from a profile's
+/// `.claude.json`, leaving the warm state (trust, MCP approvals, onboarding)
+/// intact. No-op if the file is missing or unparseable.
+fn sanitize_claude_json(path: &Path) -> Result<()> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ok(());
+    };
+    if let Some(obj) = val.as_object_mut() {
+        for key in IDENTITY_KEYS {
+            obj.remove(*key);
+        }
+    }
+    fs::write(path, serde_json::to_string_pretty(&val)?)?;
     Ok(())
 }
 
@@ -594,7 +733,7 @@ mod tests {
         fs::write(src.join("b.txt"), "world").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
         assert_eq!(fs::read_to_string(dst.join("b.txt")).unwrap(), "world");
@@ -610,7 +749,7 @@ mod tests {
         fs::write(src.join("sub/deep").join("leaf.txt"), "leaf").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         assert_eq!(fs::read_to_string(dst.join("root.txt")).unwrap(), "root");
         assert_eq!(fs::read_to_string(dst.join("sub/mid.txt")).unwrap(), "mid");
@@ -930,5 +1069,117 @@ mod tests {
 
         let out = mgr.generate_aliases().unwrap();
         assert!(out.contains("# me@work.com"), "{out}");
+    }
+
+    // ── Profile seeding ───────────────────────────────────────────────────────
+
+    #[test]
+    fn filtered_copy_skips_named_top_level_entries() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("projects")).unwrap();
+        fs::create_dir_all(src.join("skills")).unwrap();
+        fs::write(src.join("projects/transcript.jsonl"), "secret").unwrap();
+        fs::write(src.join("history.jsonl"), "every prompt").unwrap();
+        fs::write(src.join("settings.json"), "{}").unwrap();
+        fs::write(src.join("skills/a.md"), "keep me").unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all_filtered(&src, &dst, SEED_SKIP).unwrap();
+
+        assert!(!dst.join("projects").exists(), "transcripts must not be copied");
+        assert!(!dst.join("history.jsonl").exists(), "prompt history must not be copied");
+        assert!(dst.join("settings.json").exists(), "settings must be copied");
+        assert!(dst.join("skills/a.md").exists(), "skills must be copied");
+    }
+
+    #[test]
+    fn filtered_copy_only_matches_at_top_level() {
+        // A user directory that happens to share a skipped name must survive
+        // when it is nested — the filter is deliberately shallow.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("skills/cache")).unwrap();
+        fs::write(src.join("skills/cache/keep.txt"), "nested").unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all_filtered(&src, &dst, SEED_SKIP).unwrap();
+
+        assert!(dst.join("skills/cache/keep.txt").exists());
+    }
+
+    #[test]
+    fn unfiltered_copy_still_copies_everything() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("projects")).unwrap();
+        fs::write(src.join("projects/t.jsonl"), "x").unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
+
+        assert!(dst.join("projects/t.jsonl").exists());
+    }
+
+    #[test]
+    fn sanitize_strips_identity_but_keeps_trust_state() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".claude.json");
+        let original = serde_json::json!({
+            "oauthAccount": { "emailAddress": "old@work.com" },
+            "userID": "abc123",
+            "claudeAiMcpEverConnected": ["gmail"],
+            "cachedUsageUtilization": { "five_hour": 12 },
+            "projects": { "/home/me/repo": { "enabledMcpjsonServers": ["playwright"] } },
+            "hasCompletedOnboarding": true
+        });
+        fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        sanitize_claude_json(&path).unwrap();
+
+        let out: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for key in IDENTITY_KEYS {
+            assert!(out.get(*key).is_none(), "{key} should have been stripped");
+        }
+        // The whole point of seeding: trust + MCP approvals survive.
+        assert_eq!(
+            out["projects"]["/home/me/repo"]["enabledMcpjsonServers"][0],
+            "playwright"
+        );
+        assert_eq!(out["hasCompletedOnboarding"], true);
+    }
+
+    #[test]
+    fn sanitize_is_a_noop_on_missing_or_invalid_file() {
+        let tmp = TempDir::new().unwrap();
+        sanitize_claude_json(&tmp.path().join("absent.json")).unwrap();
+
+        let bad = tmp.path().join("bad.json");
+        fs::write(&bad, "not json at all").unwrap();
+        sanitize_claude_json(&bad).unwrap();
+        assert_eq!(fs::read_to_string(&bad).unwrap(), "not json at all");
+    }
+
+    #[test]
+    fn add_profile_does_not_copy_conversation_history() {
+        // Regression guard: `add` clones the *current* account, so it keeps
+        // credentials — but transcripts and prompt history are still private
+        // and must never land in a profile directory.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake"), "me@work.com");
+        fs::create_dir_all(src.join("projects")).unwrap();
+        fs::write(src.join("projects/session.jsonl"), "private conversation").unwrap();
+        fs::write(src.join("history.jsonl"), "every prompt").unwrap();
+
+        mgr.add_profile_from("work", &src).unwrap();
+        let dest = mgr.profile_dir("work");
+
+        assert!(!dest.join("projects").exists());
+        assert!(!dest.join("history.jsonl").exists());
+        // ...while the things that make a profile warm are still there.
+        assert!(dest.join(".claude.json").exists());
+        assert!(dest.join(".credentials.json").exists(), "add keeps the same account logged in");
     }
 }
