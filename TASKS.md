@@ -4,7 +4,7 @@
 
 **Current objective:** make the TUI's account-creation flow unambiguous and prevent a user who wants a different Claude account from accidentally cloning the default account's credentials.
 
-**Plan status:** Phase 1 implemented and verified 2026-07-29 (61 tests, clippy clean). Awaiting the real second-account login, which is a browser step only the user can do.
+**Plan status:** Phase 1 implemented and verified 2026-07-29 (78 tests, clippy clean). **The real second-account login landed 2026-07-29** — `business` now holds `admin@zoku.com.br`, a genuinely different account from `personal`. Phase 1 is closed.
 
 **Keep these concepts separate:**
 
@@ -39,6 +39,28 @@ The user reported being unable to log in as a second account. Three independent 
 3. **`l` could not recover.** `login_profile` bails on an existing non-empty dir, and `handle_login_name` propagated that error with `?` — so pressing `l` and typing an already-taken name tore the TUI down with an error instead of reporting it.
 
 **Fourth cause, outside this codebase:** `claude auth login` delegates account selection to the browser's claude.ai session. A signed-in browser authorises that account with no picker, so even a correctly sanitized profile can come back as the account you already had. Discovered alongside it: `claude auth login --email <addr>` pre-fills the login page (a hint, not an override).
+
+## ✅ Second account, measured 2026-07-29
+
+The login the fix was built for finally ran. Every symptom in the root-cause section is gone:
+
+| | `~/.claude` | `personal` | `business` |
+|---|---|---|---|
+| `.credentials.json` sha256 | `f5d03d01…` | `f5d03d01…` | **`91ca9db6…`** |
+| size | 1004 B | 1004 B | **930 B** |
+| `claude auth status` email | — | jaypy.uxdesign@gmail.com | **admin@zoku.com.br** |
+| orgId | — | `da41499e…` | **`ebfe92b1…`** |
+
+The byte-identical credential file that defined the original bug is broken apart, the registry email matches live auth for both profiles, and the two accounts sit in separate orgs. `~/.claude` is still `f5d03d01…` — untouched, as the isolation guarantee requires.
+
+## 🔀 Profiles run concurrently — verified 2026-07-29
+
+Isolation is per-process, not per-machine: `CLAUDE_CONFIG_DIR` is read at launch, so several profiles run **at the same time** in different terminals. Confirmed by process table with three distinct config dirs live at once — `business`, `personal` (via `cswitch use personal`), and the default `~/.claude`.
+
+This was never a design goal; it falls out of the mechanism. But it changes the threat model, because a destructive operation now has a target that may be *in use by someone else's terminal*:
+
+- **Refresh and delete could hit a live session.** Addressed in 2.8.
+- **`last_used` is a single field.** Concurrent launches make it last-writer-wins, so it records the most recent launch rather than a session. Left alone — see ROADMAP R13.
 
 ---
 
@@ -89,7 +111,7 @@ Press a
 - [x] From a TUI with an existing profile, pressing `a` visibly offers **Copy current session** and **Login to a different account**.
 - [x] Choosing Copy creates a profile with the current account and names that account before it happens.
 - [x] Choosing Login opens Claude authentication inside the new profile's `CLAUDE_CONFIG_DIR`.
-- [ ] Logging in as another account records and displays that account's actual email. — **code path verified, real second account not yet logged in** (browser step, user-only).
+- [x] Logging in as another account records and displays that account's actual email. — **verified end-to-end 2026-07-29**, see "Second account, measured" below.
 - [x] Logging in as the default account displays a same-account warning instead of silently looking like a distinct account.
 - [x] No code path changes a profile's email without corresponding authenticated credentials.
 - [x] Escape works from name entry and operation choice without creating a profile.
@@ -105,18 +127,19 @@ Press a
 - [x] **2.5 Test failed login cleanup.** `login_profile_failure_leaves_other_profiles_byte_for_byte_intact` compares credential bytes and the registry string before/after.
 - [x] **2.6 Guard destructive refresh.** `r` now routes through `Mode::ConfirmRefresh`, which shows *holds → will become* and turns red when the accounts differ. Done here rather than deferred: one keystroke could otherwise wipe the business login this work exists to create.
 - [x] **2.7 Keep credential values out of UI and logs.** Messages carry name/email/status only; no token is ever formatted.
+- [x] **2.8 Warn before overwriting or deleting a profile another session is using.** `ProfileManager::maybe_in_use` reports how recently a Claude session wrote to a profile; `ConfirmRefresh` and `ConfirmDelete` render it and turn red. Advisory, not a block — mtime is evidence, not proof, and a user who knows the other terminal is closed must still be able to proceed.
 
 ## Phase 3 — Documentation and release verification
 
 - [x] **3.1 Update TUI keybinding copy** in `README.md`, the footer, and the help popup. `a` now reads "add account", `r` says it overwrites.
 - [x] **3.2 Document Copy vs Login** — README "Copy vs Login" section, one example each, plus the browser-session caveat.
 - [x] **3.3 Document duplicate-email behavior.** README "Two profiles, one account".
-- [ ] **3.4 Run `cargo fmt --check`.** ⚠️ **Not clean, and was not clean before this work.** Baseline (upstream `src/`) already produced **44** `Diff in` hunks; the tree now produces **61**. Deliberately not run: `cargo fmt` rewrites whole files, so it would bury the behavior change under 44 hunks of inherited formatting churn. Do it as its own separate commit.
+- [x] **3.4 Run `cargo fmt --check`.** **Clean.** Deferred until the behavior changes were committed, then run on its own so the 67 inherited hunks could not bury them — 44 of those were upstream's, present before any of this work. `cargo fmt` touched `main.rs`, `profile.rs`, and `tui.rs`; tests and clippy re-verified green afterwards. Belongs in its own commit, separate from `CHANGELOG.md`.
 - [x] **3.5 Run `cargo clippy --all-targets --all-features -- -D warnings`.** Clean. Required fixing 8 pre-existing lints (7 `collapsible_if` → edition-2024 let-chains, 1 `print_literal`) that upstream had left failing.
-- [x] **3.6 Run `cargo test`.** **61 passed, 0 failed** — the original 36 plus 25 new.
-- [ ] **3.7 Manual smoke: Linux.** Copy, cancellation, same-account reporting, and relaunch are covered by tests; **different-account Login is still unverified end-to-end** because it needs a real second account through the browser.
+- [x] **3.6 Run `cargo test`.** **78 passed, 0 failed** — the original 36, plus 25 from Phase 1–2, plus 12 for the live-session guard, plus 5 for symlinked config content.
+- [x] **3.7 Manual smoke: Linux.** Different-account Login verified end-to-end 2026-07-29 (see "Second account, measured"). Copy, cancellation, same-account reporting, and relaunch remain covered by tests.
 - [ ] **3.8 Cross-platform smoke before release.** Verify macOS Keychain and Windows Credential Manager behavior on their native platforms.
-- [ ] **3.9 Add a changelog/release note** describing the behavior change without implying that profile names select Claude identities.
+- [x] **3.9 Add a changelog/release note** describing the behavior change without implying that profile names select Claude identities. `CHANGELOG.md`, Keep a Changelog format, `[Unreleased]`. Opens by stating that a profile is a config environment and its name is a local label, then frames each entry as a consequence of that. The browser-session caveat, the read-only email, the project-vs-user skills boundary, and the non-transferring MCP grants are recorded under Notes so they are not rediscovered as bugs.
 
 ---
 
@@ -141,7 +164,13 @@ Press a
 - **2026-07-29 — `login_profile` returns `LoginOutcome`, not `()`.** Callers need the verified email and the same-account list to report honestly; returning unit forced the old code to print from inside the manager.
 - **2026-07-29 — a zero exit code is not proof of a session.** `login_profile` re-checks `claude auth status` and treats "exited cleanly, no session" as failure. Otherwise a dismissed browser tab would register a credential-less profile.
 - **2026-07-29 — profile `business` deleted.** It held the personal account's credentials (byte-identical to `~/.claude`), so the name was actively misleading. Removed to free it for a real login. `personal` kept.
-- **2026-07-29 — the repo is not rustfmt-clean, and that is inherited.** Left as-is so this change stays reviewable; see 3.4.
+- **2026-07-29 — the repo is not rustfmt-clean, and that is inherited.** Left as-is so this change stays reviewable; see 3.4. **Resolved once the behavior commits landed** — `cargo fmt` then ran against a clean tree and the churn could not obscure anything.
+- **2026-07-29 — live-session detection reads mtimes, not the process table.** Two alternatives were rejected on evidence. A **lockfile written by `cswitch use`** would miss the common case outright: `cswitch aliases` emits `alias claude-x="CLAUDE_CONFIG_DIR=… claude"`, which never runs cswitch, so the guard would report "idle" for the exact sessions it exists to protect — a false negative that costs credentials. A **process-table scan** is `/proc`-specific on Linux, `ps -E` on macOS, and effectively unavailable on Windows. mtime is portable, needs no new dependency, and was measured correct against both live profiles.
+- **2026-07-29 — the activity markers are exactly the never-copied ones.** `sessions`, `session-env`, `shell-snapshots` are all in `SEED_SKIP_ALWAYS`, so no copy can stamp them with a current time and make a brand-new profile look occupied. Locked in by `session_markers_can_never_arrive_by_copy`.
+- **2026-07-29 — the in-use window is 30 minutes, deliberately generous.** Measured: an actively-typing session rewrites its markers within ~15 s, but an open-and-idle one goes minutes between writes (`personal` measured at 186 s while sitting at a live prompt). A tight window would call that idle. A false positive costs one line in a dialog; a false negative costs an account.
+- **2026-07-29 — symlinked config content stays linked.** A link in `~/.claude` is recreated as a link in the profile, not dereferenced into a copy. Linking a skill out of a repository is done *so that* edits propagate; copying would freeze a stale duplicate per profile and quietly break that. The cost is that a profile depends on the source path continuing to exist, which is already true of the original.
+- **2026-07-29 — relative link targets are absolutized.** They resolve against the link's own directory, and a profile lives somewhere else, so a verbatim copy would point at nothing — silently, which is the dangerous part. A dangling source link is still reproduced as a dangling link rather than failing the copy: that is the user's existing state, and refusing to create the profile over it would be worse.
+- **2026-07-29 — the in-use warning advises, it does not block.** mtime cannot distinguish "open in another terminal" from "closed five minutes ago", so `y` keeps its meaning and the user decides. Blocking on a heuristic would make the tool wrong in a way the user cannot override.
 
 ## Open questions — resolved 2026-07-29
 
@@ -149,12 +178,31 @@ Press a
 - [x] **Failed-login directory policy.** **Remove automatically, but only when that attempt created the directory** (`abort_login`'s `we_created_dir` flag). A cancelled login can never delete a directory that already existed, and the registry is untouched either way.
 - [x] **Copy wording.** **“Copy current session.”** It names the thing being duplicated rather than the identity, which is the distinction the old wording lost.
 
+## 🧩 What warm state actually transfers — measured 2026-07-29
+
+Prompted by a real report: after switching to `business`, the workspace's own skills were missing while its MCP servers came through. Investigated and **not a `cswitch` bug** — the two kinds of skill live in different places:
+
+| | Where it lives | Follows the profile? |
+|---|---|---|
+| **User-level skills** | `~/.claude/skills/` | **Yes** — copied by `seed_profile_dir`. All 9 verified present and loaded in the `business` session. |
+| **Project-level skills** | `<repo>/.claude/skills/` | **No** — they belong to the repo, not the config dir. `CLAUDE_CONFIG_DIR` does not relocate them and `cswitch` never sees them. |
+| **MCP server definitions** | `.claude.json` → `projects` | **Yes** — copied deliberately; the `projects` key is warm state worth keeping. |
+| **MCP OAuth grants** | per account, server-side | **No** — a different account has authorised nothing. Whimsical re-prompting is correct behavior, not lost state. |
+
+The workspace's 93 skill symlinks live at `ai-synthesizer/.claude/skills/`. They were absent because the session's project root is the `claude-switch-fork` **git submodule** (`.git` is a gitlink), which stops discovery before that ancestor — the same result under either account. Not profile-related at all.
+
+- [x] **Symlinks in the config directory — found here, fixed.** `copy_dir_all_filtered` tested `is_dir()` before `is_symlink()`. `DirEntry::file_type()` does not follow links on Unix, so a symlink-to-directory reported neither, fell through to `fs::copy`, and aborted the entire profile creation. Reproduced against the real binary before the fix — a linked skill directory gave `the source path is neither a regular file nor a symlink to a regular file`, and a dangling link gave `No such file or directory`. Links are now recreated as links, with relative targets resolved to absolute (a profile lives elsewhere, so `../../repo/x` would silently point at nothing). Verified end-to-end: `cswitch add` succeeds, the linked skill resolves from the profile, edits at the source propagate, and a dangling link stays dangling instead of being fatal.
+
 ## ▶ Next session — start here
 
-1. **Log the business account in** (user-only, needs a browser): sign out of claude.ai or open a private window, then `./target/debug/cswitch login business --email <business address>`.
-2. Verify with `CLAUDE_CONFIG_DIR=~/.claude-switch/profiles/business claude auth status --json` that the email really differs from `jaypy.uxdesign@gmail.com`.
-3. If it comes back as the personal account again, the browser session won — `cswitch remove business`, sign out properly, retry. The tool now reports this instead of hiding it.
-4. Then Phase 3.7–3.9, and decide whether `cargo fmt` gets its own commit.
+**3.8 is the only Phase 3 item left, and it cannot be done from Linux.** Everything else is closed.
+
+1. **3.8 — cross-platform smoke on macOS and Windows.** Three fork-specific things to exercise, none of which unit tests can prove:
+   - macOS Keychain and Windows Credential Manager credential handling (the original scope).
+   - `symlink_to`'s Windows fallback. Windows refuses to create symlinks without Developer Mode or elevation, so it copies the target instead. Never run on a real Windows box.
+   - The live-session guard is pure `fs::metadata` and needs no platform work, but whether its *warning* is useful on Windows is untested.
+2. **Decide what to do about the two mislabelled commits.** `6603736` and `bb803ed` are the live-session guard and symlink fix, but their messages describe "cwd-aware profile switching and path mapping" — a feature that does not exist in this repo. The branch is already pushed to `origin`, so correcting them means a force-push.
+3. **Version and release.** `Cargo.toml` is still `0.1.0` and `CHANGELOG.md` is `[Unreleased]`. Note that the branch tracks `upstream/main` (Abhishek21k), not `origin/main` — worth fixing before any push goes to the wrong place.
 
 ## Environment notes
 

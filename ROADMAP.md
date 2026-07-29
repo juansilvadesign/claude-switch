@@ -16,6 +16,8 @@
 | R10 | **Cross-platform integration matrix** | CI/release pipeline | Exercise Linux file credentials, macOS Keychain, and Windows Credential Manager with mocked command boundaries plus native smoke jobs. Unit tests alone cannot prove the platform adapters. |
 | R11 | **Release automation and provenance** | Cargo + GitHub Releases + Homebrew | Produce checksummed binaries and update distribution metadata from one tagged release. Sequence after the fork's behavior and versioning policy are settled. |
 | R12 | **Profile grouping for shared identities** | TUI list/details | When several profiles intentionally use the same email, group or badge them as separate environments for one account. The active fix only needs an honest warning. |
+| R13 | **Per-session tracking instead of `last_used`** | Registry | Profiles run concurrently (see `TASKS.md`), so one `last_used` timestamp is last-writer-wins: it records the most recent *launch*, not which profiles are open. A session list would also let the TUI mark live profiles in the list rather than only inside a confirmation. Needs a session lifetime model — start, end, and crash recovery — which is more than the immediate guard required. |
+| R14 | **Promote live-session detection from mtime to a real signal** | `maybe_in_use` | The 2.8 guard infers activity from never-copied marker mtimes: portable and dependency-free, but it cannot separate "open in another terminal" from "closed a few minutes ago". A process-table check (`/proc` on Linux, `ps -E` on macOS) could confirm a live session where available and fall back to mtime elsewhere. Only worth it if the advisory warning proves too noisy in practice. |
 
 ## Out of scope
 
