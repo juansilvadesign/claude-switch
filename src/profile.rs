@@ -50,7 +50,14 @@ pub struct ProfileManager {
 impl ProfileManager {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let base_dir = home.join(".claude-switch");
+        Self::with_base_dir(home.join(".claude-switch"))
+    }
+
+    /// Build a manager rooted at an arbitrary directory.
+    ///
+    /// Exists so tests can drive a manager that cannot reach the real
+    /// `~/.claude-switch`; `new()` is the same call with the home path.
+    pub fn with_base_dir(base_dir: PathBuf) -> Result<Self> {
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir)?;

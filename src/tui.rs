@@ -30,9 +30,23 @@ enum Mode {
     Search,
     Help,
     ConfirmDelete,
+    ConfirmRefresh,
     AddName,
+    /// Name accepted; now choosing *how* the profile gets its account.
+    /// Split from `AddName` so Esc backs out one step at a time and the
+    /// side effect is named before it happens.
+    AddChoice,
     LoginName,
     Message(String, bool),
+}
+
+/// Work that has to happen with the TUI torn down — it spawns `claude`, which
+/// needs the real terminal. Queued by a key handler, drained by the event loop,
+/// which restores the terminal around it and rebuilds it afterwards.
+#[derive(Debug, Clone, PartialEq)]
+enum PendingAction {
+    /// Authenticate a brand-new profile as a different Claude account.
+    Login { name: String },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -47,6 +61,19 @@ pub struct App {
     filtered_indices: Vec<usize>,
     detected_email: Option<String>,
     claude_dir_found: bool,
+    /// Account currently logged in under `~/.claude`, resolved when the add
+    /// flow starts so "Copy" can name what it is about to copy.
+    current_account: Option<String>,
+    pending: Option<PendingAction>,
+    /// How the live account gets resolved. Swapped in tests so the choice
+    /// screen can be exercised without a real `~/.claude` behind it.
+    account_probe: AccountProbe,
+}
+
+type AccountProbe = fn() -> Option<String>;
+
+fn live_account_email() -> Option<String> {
+    detect_current_account().and_then(|a| a.email)
 }
 
 impl App {
@@ -77,6 +104,9 @@ impl App {
             filtered_indices,
             detected_email,
             claude_dir_found,
+            current_account: None,
+            pending: None,
+            account_probe: live_account_email,
         })
     }
 
@@ -205,8 +235,16 @@ impl App {
                     Mode::ConfirmDelete => {
                         self.handle_confirm_delete(key.code)?;
                     }
+                    Mode::ConfirmRefresh => {
+                        self.handle_confirm_refresh(key.code)?;
+                    }
                     Mode::AddName => {
                         if self.handle_add_name(key.code)? {
+                            return Ok(());
+                        }
+                    }
+                    Mode::AddChoice => {
+                        if self.handle_add_choice(key.code)? {
                             return Ok(());
                         }
                     }
@@ -220,7 +258,68 @@ impl App {
                     }
                 }
             }
+
+            // Anything that needs the bare terminal runs here, between frames,
+            // so the TUI is fully torn down before `claude` takes over stdin.
+            if let Some(action) = self.pending.take() {
+                self.run_pending(action, terminal)?;
+            }
         }
+    }
+
+    /// Tear the TUI down, run `action` against the real terminal, then rebuild
+    /// the TUI and carry on. Errors are shown in-app rather than propagated —
+    /// a cancelled or failed login must not take the whole program down with it.
+    fn run_pending(
+        &mut self,
+        action: PendingAction,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<()> {
+        ratatui::restore();
+
+        // `select` is only set when a profile actually landed in the registry,
+        // so a failed attempt leaves the current selection alone.
+        let (select, message) = match action {
+            PendingAction::Login { name } => {
+                match self.manager.login_profile(&name, false, None) {
+                    Ok(result) => {
+                        let others: Vec<&str> = result
+                            .same_account_as
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|n| *n != name)
+                            .collect();
+
+                        let msg = if others.is_empty() {
+                            format!("Profile '{}' logged in as {}.", name, result.display_email())
+                        } else {
+                            // Not an error: two profiles for one account is a
+                            // valid setup. But say it, or it reads as a new one.
+                            format!(
+                                "Profile '{}' is {} — the same account as {}. \
+                                 Sign out of claude.ai and retry if you wanted a different one.",
+                                name,
+                                result.display_email(),
+                                others.join(", ")
+                            )
+                        };
+                        (Some(name), Mode::Message(msg, false))
+                    }
+                    Err(e) => (None, Mode::Message(e.to_string(), true)),
+                }
+            }
+        };
+
+        // Rebuild the terminal the loop is about to draw into.
+        *terminal = ratatui::init();
+        terminal.clear()?;
+
+        self.refresh()?;
+        if let Some(name) = select {
+            self.select_by_name(&name);
+        }
+        self.mode = message;
+        Ok(())
     }
 
     // ── Key handlers ──────────────────────────────────────────────────────────
@@ -274,10 +373,10 @@ impl App {
                 if name.is_empty() {
                     return Ok(false);
                 }
-                ratatui::restore();
-                let outcome = self.manager.login_profile(&name, false, None)?;
-                crate::report_login(&name, &outcome);
-                return Ok(true);
+                self.detected_email = None;
+                self.claude_dir_found = false;
+                self.mode = Mode::Normal;
+                self.pending = Some(PendingAction::Login { name });
             }
 
             KeyCode::Backspace => {
@@ -338,22 +437,47 @@ impl App {
                 }
             }
 
-            KeyCode::Char('r') => {
-                if let Some(p) = self.selected_profile() {
-                    let name = p.name.clone();
-                    ratatui::restore();
-                    println!("Refreshing profile '{}'…", name);
-                    match self.manager.add_profile_force(&name, false) {
-                        Ok(_) => println!("Profile '{}' refreshed from current ~/.claude", name),
-                        Err(e) => eprintln!("Error: {}", e),
-                    }
-                    return Ok(true);
-                }
+            // `r` replaces the profile's credentials with whatever ~/.claude
+            // currently holds. Harmless when both are the same account, silent
+            // account theft when they are not — so it is confirmed against the
+            // identities involved.
+            KeyCode::Char('r') if self.selected_profile().is_some() => {
+                self.current_account = (self.account_probe)();
+                self.mode = Mode::ConfirmRefresh;
             }
 
             _ => {}
         }
         Ok(false)
+    }
+
+    fn handle_confirm_refresh(&mut self, code: KeyCode) -> Result<()> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(p) = self.selected_profile() {
+                    let name = p.name.clone();
+                    match self.manager.add_profile_force(&name, false) {
+                        Ok(p) => {
+                            self.refresh()?;
+                            self.select_by_name(&name);
+                            self.mode = Mode::Message(
+                                format!(
+                                    "Profile '{}' refreshed from the current session ({}).",
+                                    name,
+                                    p.email.as_deref().unwrap_or("unknown account")
+                                ),
+                                false,
+                            );
+                        }
+                        Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                    }
+                } else {
+                    self.mode = Mode::Normal;
+                }
+            }
+            _ => self.mode = Mode::Normal,
+        }
+        Ok(())
     }
 
     fn handle_search_key(
@@ -416,6 +540,9 @@ impl App {
         Ok(())
     }
 
+    /// Name entry for the unified add flow. Enter advances to the operation
+    /// choice; it never creates anything, because at this point we still do not
+    /// know whether the user wants this account or a different one.
     fn handle_add_name(&mut self, code: KeyCode) -> Result<bool> {
         match code {
             KeyCode::Enter => {
@@ -424,14 +551,13 @@ impl App {
                     self.mode = Mode::Normal;
                     return Ok(false);
                 }
-                match self.manager.add_profile(&name, false) {
-                    Ok(_) => {
-                        self.refresh()?;
-                        self.select_by_name(&name);
-                        self.mode = Mode::Message(format!("Profile '{}' added.", name), false);
-                    }
-                    Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                if let Some(existing) = self.existing_profile_error(&name) {
+                    self.mode = Mode::Message(existing, true);
+                    return Ok(false);
                 }
+                // Resolve the live account now so the Copy option can name it.
+                self.current_account = (self.account_probe)();
+                self.mode = Mode::AddChoice;
             }
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Backspace => {
@@ -445,6 +571,48 @@ impl App {
         Ok(false)
     }
 
+    /// The decision that used to be implicit: copy the account we already have,
+    /// or authenticate a different one. Each key maps to exactly one backend
+    /// operation — no shared path that could drift into the wrong side effect.
+    fn handle_add_choice(&mut self, code: KeyCode) -> Result<bool> {
+        let name = self.input_buffer.trim().to_string();
+        if name.is_empty() {
+            self.mode = Mode::Normal;
+            return Ok(false);
+        }
+
+        match code {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                match self.manager.add_profile(&name, false) {
+                    Ok(p) => {
+                        self.refresh()?;
+                        self.select_by_name(&name);
+                        self.mode = Mode::Message(
+                            format!(
+                                "Profile '{}' created from the current session ({}).",
+                                name,
+                                p.email.as_deref().unwrap_or("unknown account")
+                            ),
+                            false,
+                        );
+                    }
+                    Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.pending = Some(PendingAction::Login { name });
+            }
+            // Esc steps back to the name, not out of the flow — a typo in the
+            // name should not cost the whole interaction.
+            KeyCode::Esc | KeyCode::Backspace => self.mode = Mode::AddName,
+            KeyCode::Char('q') => self.mode = Mode::Normal,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Fast path for users who already know they want a different account.
+    /// Same backend operation as `AddChoice`'s `l`.
     fn handle_login_name(&mut self, code: KeyCode) -> Result<bool> {
         match code {
             KeyCode::Enter => {
@@ -453,10 +621,11 @@ impl App {
                     self.mode = Mode::Normal;
                     return Ok(false);
                 }
-                ratatui::restore();
-                let outcome = self.manager.login_profile(&name, false, None)?;
-                crate::report_login(&name, &outcome);
-                return Ok(true);
+                if let Some(existing) = self.existing_profile_error(&name) {
+                    self.mode = Mode::Message(existing, true);
+                    return Ok(false);
+                }
+                self.pending = Some(PendingAction::Login { name });
             }
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Backspace => {
@@ -468,6 +637,18 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Reject a taken name up front, in the popup, instead of letting the
+    /// backend bail after the terminal has already been torn down.
+    fn existing_profile_error(&self, name: &str) -> Option<String> {
+        self.profiles.iter().find(|p| p.name == name).map(|p| {
+            format!(
+                "Profile '{}' already exists ({}). Delete it first with 'd', or pick another name.",
+                name,
+                p.email.as_deref().unwrap_or("unknown account")
+            )
+        })
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -507,7 +688,9 @@ impl App {
         match &self.mode.clone() {
             Mode::Help => self.render_help(f),
             Mode::ConfirmDelete => self.render_confirm_delete_popup(f),
+            Mode::ConfirmRefresh => self.render_confirm_refresh_popup(f),
             Mode::AddName => self.render_add_name_popup(f),
+            Mode::AddChoice => self.render_add_choice_popup(f),
             Mode::LoginName => self.render_login_name_popup(f),
             Mode::Message(msg, is_err) => self.render_message(f, msg, *is_err),
             _ => {}
@@ -911,8 +1094,8 @@ impl App {
                 ("↑↓/jk", "nav"),
                 ("enter", "launch"),
                 ("/", "search"),
+                ("a", "add account"),
                 ("l", "login"),
-                ("a", "add"),
                 ("r", "refresh"),
                 ("d", "delete"),
                 ("?", "help"),
@@ -957,9 +1140,9 @@ impl App {
             ("↑/↓  j/k", "Navigate profiles"),
             ("Enter", "Launch Claude with selected profile"),
             ("/", "Search profiles by name or email"),
-            ("l", "Login — add new account (opens Claude)"),
-            ("a", "Add — copy current session as profile"),
-            ("r", "Refresh — re-copy current session into selected"),
+            ("a", "Add account — then choose copy or login"),
+            ("l", "Login — straight to a different account"),
+            ("r", "Refresh — overwrite with current session"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
             ("q / Esc", "Quit"),
@@ -981,7 +1164,11 @@ impl App {
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  CLI:  cswitch --help  for command-line usage",
+            "  A profile is a config environment, not an identity.",
+            Style::default().fg(DIM),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Its account comes from logging in — never from the name.",
             Style::default().fg(DIM),
         )));
         lines.push(Line::from(""));
@@ -1034,12 +1221,12 @@ impl App {
     }
 
     fn render_add_name_popup(&self, f: &mut Frame) {
-        let area = centered_rect(50, 7, f.area());
+        let area = centered_rect(52, 7, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
             .title(Line::from(Span::styled(
-                " Add Profile (copy session) ",
+                " Add Account ",
                 Style::default().fg(ACCENT).bold(),
             )))
             .borders(Borders::ALL)
@@ -1051,19 +1238,146 @@ impl App {
             Paragraph::new(Text::from(vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  Name: ", Style::default().fg(DIM)),
+                    Span::styled("  Profile name: ", Style::default().fg(DIM)),
                     Span::styled(self.input_buffer.clone(), Style::default().fg(TEXT).bold()),
                     Span::styled("█", Style::default().fg(ACCENT)),
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Copies current ~/.claude session into this profile.",
+                    "  A local label. You pick the account on the next step.",
                     Style::default().fg(DIM),
                 )),
             ]))
             .block(block),
             area,
         );
+    }
+
+    /// The step that makes the side effect explicit before it happens.
+    fn render_add_choice_popup(&self, f: &mut Frame) {
+        let area = centered_rect(66, 12, f.area());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Add Account — which account? ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let current = self.current_account.as_deref().unwrap_or("unknown account");
+
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Profile: ", Style::default().fg(DIM)),
+                    Span::styled(self.input_buffer.clone(), Style::default().fg(TEXT).bold()),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [c] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled("Copy current session  ", Style::default().fg(TEXT)),
+                    Span::styled(current.to_string(), Style::default().fg(SUCCESS)),
+                ]),
+                Line::from(Span::styled(
+                    "      Same account, separate settings and history.",
+                    Style::default().fg(DIM),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [l] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled("Log in to a different Claude account", Style::default().fg(TEXT)),
+                ]),
+                Line::from(Span::styled(
+                    "      Opens Claude's login. Sign out of claude.ai first,",
+                    Style::default().fg(DIM),
+                )),
+                Line::from(Span::styled(
+                    "      or it will grant the account already signed in there.",
+                    Style::default().fg(DIM),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Esc back · q cancel",
+                    Style::default().fg(MUTED),
+                )),
+            ]))
+            .block(block),
+            area,
+        );
+    }
+
+    fn render_confirm_refresh_popup(&self, f: &mut Frame) {
+        let area = centered_rect(66, 11, f.area());
+        f.render_widget(Clear, area);
+
+        let (name, profile_email) = match self.selected_profile() {
+            Some(p) => (
+                p.name.clone(),
+                p.email.as_deref().unwrap_or("unknown account").to_string(),
+            ),
+            None => return,
+        };
+        let current = self.current_account.as_deref().unwrap_or("unknown account");
+        // Only cross-account refreshes actually destroy anything.
+        let replaces_account = self
+            .current_account
+            .as_deref()
+            .map(|c| !c.eq_ignore_ascii_case(&profile_email))
+            .unwrap_or(true);
+        let color = if replaces_account { DANGER } else { ACCENT };
+
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Refresh profile ",
+                Style::default().fg(color).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(color))
+            .style(Style::default().bg(PANEL));
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Overwrite '", Style::default().fg(TEXT)),
+                Span::styled(name, Style::default().fg(TEXT).bold()),
+                Span::styled("' with the current session.", Style::default().fg(TEXT)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Profile holds: ", Style::default().fg(DIM)),
+                Span::styled(profile_email, Style::default().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Will become:   ", Style::default().fg(DIM)),
+                Span::styled(current.to_string(), Style::default().fg(SUCCESS)),
+            ]),
+            Line::from(""),
+        ];
+
+        if replaces_account {
+            lines.push(Line::from(Span::styled(
+                "  This replaces a DIFFERENT account's credentials.",
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  You will have to log that account in again.",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(Span::styled(
+            "  [y] Confirm   ·   any other key cancels",
+            Style::default().fg(MUTED),
+        )));
+
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn render_login_name_popup(&self, f: &mut Frame) {
@@ -1149,5 +1463,339 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width: w,
         height: height.min(area.height),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::Profile;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    const STUB_EMAIL: &str = "current@example.com";
+
+    fn stub_account() -> Option<String> {
+        Some(STUB_EMAIL.to_string())
+    }
+
+    fn no_account() -> Option<String> {
+        None
+    }
+
+    /// An App wired to a manager that cannot reach the real `~/.claude-switch`,
+    /// with the live-account probe stubbed out.
+    fn make_app(tmp: &TempDir, existing: &[(&str, Option<&str>)]) -> App {
+        let manager =
+            ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
+
+        for (name, email) in existing {
+            let mut registry = manager.load_registry().unwrap();
+            registry.profiles.insert(
+                name.to_string(),
+                Profile {
+                    name: name.to_string(),
+                    email: email.map(String::from),
+                    added: Utc::now(),
+                    last_used: None,
+                },
+            );
+            let content = serde_json::to_string_pretty(&registry).unwrap();
+            std::fs::write(tmp.path().join(".claude-switch/registry.json"), content).unwrap();
+        }
+
+        let mut app = App::new(manager).unwrap();
+        app.account_probe = stub_account;
+        // `App::new` starts in FirstRun when the registry is empty, which also
+        // pre-seeds the buffer with "default". These tests are about the normal
+        // TUI — the case the bug lived in — where `a`/`l` clear the buffer.
+        app.mode = Mode::Normal;
+        app.input_buffer.clear();
+        app
+    }
+
+    fn type_name(app: &mut App, name: &str) {
+        for c in name.chars() {
+            app.handle_add_name(KeyCode::Char(c)).unwrap();
+        }
+    }
+
+    // ── `a` → name → choice ───────────────────────────────────────────────────
+
+    #[test]
+    fn add_key_opens_name_entry_not_a_copy() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
+
+        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+
+        assert_eq!(app.mode, Mode::AddName);
+        assert!(app.input_buffer.is_empty());
+        // Nothing may be created before the user has said which account.
+        assert!(app.pending.is_none());
+        assert_eq!(app.profiles.len(), 1);
+    }
+
+    #[test]
+    fn name_entry_advances_to_choice_and_resolves_current_account() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddName;
+
+        type_name(&mut app, "business");
+        app.handle_add_name(KeyCode::Enter).unwrap();
+
+        assert_eq!(app.mode, Mode::AddChoice);
+        assert_eq!(app.current_account.as_deref(), Some(STUB_EMAIL));
+        // Still nothing created — the choice has not been made yet.
+        assert!(app.pending.is_none());
+        assert!(app.manager.load_registry().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn choice_screen_falls_back_when_account_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.account_probe = no_account;
+        app.mode = Mode::AddName;
+
+        type_name(&mut app, "business");
+        app.handle_add_name(KeyCode::Enter).unwrap();
+
+        assert_eq!(app.mode, Mode::AddChoice);
+        assert!(app.current_account.is_none());
+    }
+
+    #[test]
+    fn empty_name_cancels_instead_of_advancing() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddName;
+
+        app.handle_add_name(KeyCode::Enter).unwrap();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn name_entry_ignores_characters_invalid_in_a_directory_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddName;
+
+        for c in "a/b .c*".chars() {
+            app.handle_add_name(KeyCode::Char(c)).unwrap();
+        }
+
+        assert_eq!(app.input_buffer, "abc");
+    }
+
+    #[test]
+    fn duplicate_name_is_rejected_before_the_terminal_is_torn_down() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some("me@example.com"))]);
+        app.mode = Mode::AddName;
+
+        type_name(&mut app, "business");
+        app.handle_add_name(KeyCode::Enter).unwrap();
+
+        match &app.mode {
+            Mode::Message(msg, is_err) => {
+                assert!(*is_err, "duplicate name should be an error");
+                assert!(msg.contains("already exists"), "{msg}");
+                assert!(msg.contains("me@example.com"), "{msg}");
+            }
+            other => panic!("expected an error message, got {other:?}"),
+        }
+        assert!(app.pending.is_none());
+    }
+
+    // ── Routing: Copy and Login cannot be confused ────────────────────────────
+
+    #[test]
+    fn choice_l_routes_to_login_and_creates_nothing_yet() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "business".to_string();
+
+        app.handle_add_choice(KeyCode::Char('l')).unwrap();
+
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::Login { name: "business".to_string() })
+        );
+        // Login must not register anything until Claude has authenticated.
+        assert!(app.manager.load_registry().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn choice_c_never_routes_to_login() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "copy-target".to_string();
+
+        // Copy runs against the real `~/.claude`, so it may succeed or fail
+        // depending on the machine. Either way it must resolve inline and must
+        // never queue an authentication.
+        app.handle_add_choice(KeyCode::Char('c')).unwrap();
+
+        assert!(app.pending.is_none(), "Copy must not queue a login");
+        assert!(matches!(app.mode, Mode::Message(_, _)));
+    }
+
+    #[test]
+    fn choice_accepts_uppercase_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "business".to_string();
+
+        app.handle_add_choice(KeyCode::Char('L')).unwrap();
+
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::Login { name: "business".to_string() })
+        );
+    }
+
+    // ── Back / cancel ────────────────────────────────────────────────────────
+
+    #[test]
+    fn esc_from_choice_steps_back_to_the_name_it_came_from() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "business".to_string();
+
+        app.handle_add_choice(KeyCode::Esc).unwrap();
+
+        assert_eq!(app.mode, Mode::AddName);
+        assert_eq!(app.input_buffer, "business", "the typed name should survive");
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn q_from_choice_cancels_the_whole_flow() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "business".to_string();
+
+        app.handle_add_choice(KeyCode::Char('q')).unwrap();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending.is_none());
+        assert!(app.manager.load_registry().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn esc_from_name_entry_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddName;
+        type_name(&mut app, "business");
+
+        app.handle_add_name(KeyCode::Esc).unwrap();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending.is_none());
+        assert!(app.manager.load_registry().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn unknown_key_on_choice_screen_does_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "business".to_string();
+
+        app.handle_add_choice(KeyCode::Char('x')).unwrap();
+
+        assert_eq!(app.mode, Mode::AddChoice);
+        assert!(app.pending.is_none());
+    }
+
+    // ── `l` fast path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn l_key_still_goes_straight_to_login_name_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
+
+        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE).unwrap();
+
+        assert_eq!(app.mode, Mode::LoginName);
+    }
+
+    #[test]
+    fn login_name_queues_the_same_action_as_the_choice_screen() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::LoginName;
+        for c in "business".chars() {
+            app.handle_login_name(KeyCode::Char(c)).unwrap();
+        }
+
+        app.handle_login_name(KeyCode::Enter).unwrap();
+
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::Login { name: "business".to_string() })
+        );
+    }
+
+    #[test]
+    fn login_on_an_existing_name_reports_instead_of_exiting() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some("me@example.com"))]);
+        app.mode = Mode::LoginName;
+        for c in "business".chars() {
+            app.handle_login_name(KeyCode::Char(c)).unwrap();
+        }
+
+        // The old code propagated this error out of the event loop, killing
+        // the TUI. It has to surface as an in-app message instead.
+        let should_exit = app.handle_login_name(KeyCode::Enter).unwrap();
+
+        assert!(!should_exit, "a taken name must not quit the TUI");
+        assert!(matches!(app.mode, Mode::Message(_, true)));
+        assert!(app.pending.is_none());
+    }
+
+    // ── Destructive refresh ──────────────────────────────────────────────────
+
+    #[test]
+    fn r_key_asks_before_overwriting_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some("other@example.com"))]);
+
+        let should_exit = app
+            .handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert!(!should_exit);
+        assert_eq!(app.mode, Mode::ConfirmRefresh);
+        assert_eq!(app.current_account.as_deref(), Some(STUB_EMAIL));
+    }
+
+    #[test]
+    fn declining_the_refresh_leaves_the_profile_alone() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some("other@example.com"))]);
+        app.mode = Mode::ConfirmRefresh;
+
+        app.handle_confirm_refresh(KeyCode::Char('n')).unwrap();
+
+        assert_eq!(app.mode, Mode::Normal);
+        let registry = app.manager.load_registry().unwrap();
+        assert_eq!(
+            registry.profiles["business"].email.as_deref(),
+            Some("other@example.com")
+        );
     }
 }
