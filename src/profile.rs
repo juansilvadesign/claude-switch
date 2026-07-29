@@ -20,6 +20,24 @@ pub struct Registry {
     pub profiles: HashMap<String, Profile>,
 }
 
+/// The verified result of a completed `login_profile`.
+///
+/// `email` is what Claude reported after authenticating — never what the user
+/// typed. `same_account_as` lists profiles that were already registered to that
+/// same account, so the caller can say "this is the account you already had"
+/// instead of implying a new one was added.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoginOutcome {
+    pub email: Option<String>,
+    pub same_account_as: Vec<String>,
+}
+
+impl LoginOutcome {
+    pub fn display_email(&self) -> &str {
+        self.email.as_deref().unwrap_or("unknown account")
+    }
+}
+
 // ── ProfileManager ────────────────────────────────────────────────────────────
 
 pub struct ProfileManager {
@@ -32,7 +50,14 @@ pub struct ProfileManager {
 impl ProfileManager {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let base_dir = home.join(".claude-switch");
+        Self::with_base_dir(home.join(".claude-switch"))
+    }
+
+    /// Build a manager rooted at an arbitrary directory.
+    ///
+    /// Exists so tests can drive a manager that cannot reach the real
+    /// `~/.claude-switch`; `new()` is the same call with the home path.
+    pub fn with_base_dir(base_dir: PathBuf) -> Result<Self> {
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir)?;
@@ -128,10 +153,10 @@ impl ProfileManager {
         }
 
         // 2. Extract platform-specific credentials if not already present
-        if !dest.join(".credentials.json").exists() {
-            if let Some(creds) = extract_platform_credentials() {
-                fs::write(dest.join(".credentials.json"), creds)?;
-            }
+        if !dest.join(".credentials.json").exists()
+            && let Some(creds) = extract_platform_credentials()
+        {
+            fs::write(dest.join(".credentials.json"), creds)?;
         }
 
         Ok(())
@@ -203,45 +228,104 @@ impl ProfileManager {
     /// Claude version introduces an identity key this code does not know about,
     /// the profile still cannot authenticate as the old account — Claude has to
     /// re-authenticate and overwrites the stale metadata itself.
-    pub fn login_profile(&self, name: &str, include_history: bool) -> Result<()> {
+    pub fn login_profile(
+        &self,
+        name: &str,
+        include_history: bool,
+        email_hint: Option<&str>,
+    ) -> Result<LoginOutcome> {
         let profile_dir = self.profiles_dir.join(name);
-        if profile_dir.exists() {
-            let has_files = profile_dir.read_dir()?.next().is_some();
-            if has_files {
-                bail!("Profile '{}' already exists. Remove it first or pick a different name.", name);
-            }
+        // Never authenticate into a directory we did not just create: a
+        // half-written login must not be able to clobber a working profile.
+        let we_created_dir = !profile_dir.exists();
+        if !we_created_dir && profile_dir.read_dir()?.next().is_some() {
+            bail!(
+                "Profile '{}' already exists and holds an account. Delete it first \
+                 (cswitch remove {}) or pick a different name.",
+                name,
+                name
+            );
         }
         fs::create_dir_all(&profile_dir)?;
-        let seeded = self.seed_profile_dir(&profile_dir, include_history)?;
+
+        // Any early return past this point must not leave a staged directory
+        // behind, so failures funnel through `abort_login`.
+        let seeded = match self.seed_profile_dir(&profile_dir, include_history) {
+            Ok(seeded) => seeded,
+            Err(e) => {
+                abort_login(&profile_dir, we_created_dir);
+                return Err(e);
+            }
+        };
 
         if seeded {
             println!("Seeded '{}' from your current setup (settings, skills, project trust).", name);
             println!("Conversation history and session transcripts were not copied.\n");
         }
-        println!("Opening your browser — sign in with the account for profile '{}'.\n", name);
+
+        println!("Opening your browser — sign in as the account for profile '{}'.", name);
+        // The OAuth grant follows the *browser's* claude.ai session, not this
+        // directory. A signed-in browser authorises that account with no picker,
+        // which is precisely how a "new" profile ends up cloning the old one.
+        println!(
+            "  If claude.ai is already signed in as another account, sign out first\n  \
+             or complete this login in a private window.\n"
+        );
 
         // `claude auth login` is the purpose-built flow: it opens the browser,
         // waits for the OAuth round-trip, and exits. Launching the full TUI
         // instead would leave the user to remember `/exit`, and would trip
         // Claude's nested-session guard when run from inside a Claude session.
-        let status = std::process::Command::new("claude")
-            .args(["auth", "login"])
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args(["auth", "login"]);
+        // `--email` only pre-fills the login page; it does not override a live
+        // browser session. Treated as a convenience, never as a guarantee.
+        if let Some(hint) = email_hint.map(str::trim).filter(|h| !h.is_empty()) {
+            cmd.args(["--email", hint]);
+        }
+        let status = cmd
             .env("CLAUDE_CONFIG_DIR", &profile_dir)
             .status()
-            .context("Failed to launch claude. Is it installed and in your PATH?")?;
+            .context("Failed to launch claude. Is it installed and in your PATH?");
+
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
+                abort_login(&profile_dir, we_created_dir);
+                return Err(e);
+            }
+        };
 
         if !status.success() {
+            abort_login(&profile_dir, we_created_dir);
             bail!(
                 "Login did not complete for profile '{}'. Nothing was registered — \
-                 remove the directory and retry with: cswitch login {}",
+                 retry with: cswitch login {}",
                 name,
                 name
             );
         }
 
         // Ask Claude who it ended up as, rather than re-parsing the config we
-        // just sanitized.
+        // just sanitized. A successful exit code is not proof of a session.
         let email = read_account_email(&profile_dir).or_else(|| read_email_from_dir(&profile_dir));
+        if email.is_none() {
+            abort_login(&profile_dir, we_created_dir);
+            bail!(
+                "Claude exited without an authenticated session, so profile '{}' was \
+                 not registered. Retry with: cswitch login {}",
+                name,
+                name
+            );
+        }
+
+        // Same Claude account under two profile names is legitimate (isolated
+        // settings, separate MCP trust), so this warns rather than fails.
+        let same_account_as = match email.as_deref() {
+            Some(e) => self.profiles_with_email(e)?,
+            None => Vec::new(),
+        };
+
         let profile = Profile {
             name: name.to_string(),
             email: email.clone(),
@@ -250,10 +334,27 @@ impl ProfileManager {
         };
         self.upsert_profile(profile)?;
 
-        let display_email = email.as_deref().unwrap_or("unknown");
-        println!("\nProfile '{}' registered (account: {}).", name, display_email);
-        println!("Launch with: cswitch use {}", name);
-        Ok(())
+        Ok(LoginOutcome { email, same_account_as })
+    }
+
+    /// Names of already-registered profiles authenticated as `email`.
+    /// Case-insensitive: Claude echoes the address as the user typed it.
+    pub fn profiles_with_email(&self, email: &str) -> Result<Vec<String>> {
+        let target = email.trim().to_lowercase();
+        let mut names: Vec<String> = self
+            .load_registry()?
+            .profiles
+            .into_values()
+            .filter(|p| {
+                p.email
+                    .as_deref()
+                    .map(|e| e.trim().to_lowercase() == target)
+                    .unwrap_or(false)
+            })
+            .map(|p| p.name)
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     /// Print shell alias/function lines for all managed profiles.
@@ -523,6 +624,18 @@ fn copy_dir_all_filtered(src: &Path, dst: &Path, skip_top_level: &[&str]) -> Res
 /// Remove the keys that identify a specific Claude account from a profile's
 /// `.claude.json`, leaving the warm state (trust, MCP approvals, onboarding)
 /// intact. No-op if the file is missing or unparseable.
+/// Roll back a failed login attempt.
+///
+/// Only removes the staging directory when *this* attempt created it, so a
+/// cancelled login can never delete a directory that already existed. Cleanup
+/// failure is deliberately swallowed: the caller is already reporting the real
+/// error, and a leftover directory is recoverable while a masked cause is not.
+fn abort_login(profile_dir: &Path, we_created_dir: bool) {
+    if we_created_dir {
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+}
+
 fn sanitize_claude_json(path: &Path) -> Result<()> {
     let Ok(content) = fs::read_to_string(path) else {
         return Ok(());
@@ -637,16 +750,14 @@ fn read_account_email(profile_dir: &Path) -> Option<String> {
 /// Read email from `~/.claude.json` at home root (macOS stores account metadata here).
 fn read_email_from_home_root(home: &Path) -> Option<String> {
     let path = home.join(".claude.json");
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(email) = val
-                .get("oauthAccount")
-                .and_then(|o| o.get("emailAddress"))
-                .and_then(|e| e.as_str())
-            {
-                return Some(email.to_string());
-            }
-        }
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(email) = val
+            .get("oauthAccount")
+            .and_then(|o| o.get("emailAddress"))
+            .and_then(|e| e.as_str())
+    {
+        return Some(email.to_string());
     }
     None
 }
@@ -656,28 +767,24 @@ fn read_email_from_home_root(home: &Path) -> Option<String> {
 /// `.credentials.json` → `claudeAiOauth.email` as fallback.
 fn read_email_from_dir(dir: &Path) -> Option<String> {
     for filename in &[".claude.json", "claude.json"] {
-        if let Ok(content) = fs::read_to_string(dir.join(filename)) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(email) = val
-                    .get("oauthAccount")
-                    .and_then(|o| o.get("emailAddress"))
-                    .and_then(|e| e.as_str())
-                {
-                    return Some(email.to_string());
-                }
-            }
+        if let Ok(content) = fs::read_to_string(dir.join(filename))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(email) = val
+                .get("oauthAccount")
+                .and_then(|o| o.get("emailAddress"))
+                .and_then(|e| e.as_str())
+        {
+            return Some(email.to_string());
         }
     }
-    if let Ok(content) = fs::read_to_string(dir.join(".credentials.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(email) = val
-                .get("claudeAiOauth")
-                .and_then(|o| o.get("email"))
-                .and_then(|e| e.as_str())
-            {
-                return Some(email.to_string());
-            }
-        }
+    if let Ok(content) = fs::read_to_string(dir.join(".credentials.json"))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(email) = val
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("email"))
+            .and_then(|e| e.as_str())
+    {
+        return Some(email.to_string());
     }
     None
 }
@@ -1082,6 +1189,98 @@ mod tests {
 
     // ── login_profile ──────────────────────────────────────────────────────
 
+    // ── profiles_with_email ───────────────────────────────────────────────
+
+    #[test]
+    fn profiles_with_email_finds_every_profile_on_that_account() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        for (name, email) in [("work", "same@x.com"), ("solo", "same@x.com"), ("alt", "other@x.com")] {
+            let src = make_claude_dir(&tmp.path().join(name), email);
+            mgr.add_profile_from(name, &src).unwrap();
+        }
+
+        assert_eq!(mgr.profiles_with_email("same@x.com").unwrap(), vec!["solo", "work"]);
+        assert_eq!(mgr.profiles_with_email("other@x.com").unwrap(), vec!["alt"]);
+    }
+
+    #[test]
+    fn profiles_with_email_ignores_case_and_padding() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("work"), "Me@Example.COM");
+        mgr.add_profile_from("work", &src).unwrap();
+
+        assert_eq!(mgr.profiles_with_email("  me@example.com ").unwrap(), vec!["work"]);
+    }
+
+    #[test]
+    fn profiles_with_email_returns_empty_for_an_unseen_account() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("work"), "me@x.com");
+        mgr.add_profile_from("work", &src).unwrap();
+
+        assert!(mgr.profiles_with_email("nobody@x.com").unwrap().is_empty());
+    }
+
+    #[test]
+    fn profiles_with_unknown_email_never_match_each_other() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        // A profile whose email could not be read stores None. Two of those are
+        // not evidence of a shared account, so they must not be reported as one.
+        let src = make_claude_dir_creds_only(&tmp.path().join("a"), "unreadable");
+        mgr.add_profile_from("a", &src).unwrap();
+
+        assert!(mgr.profiles_with_email("").unwrap().is_empty());
+    }
+
+    // ── abort_login ───────────────────────────────────────────────────────
+
+    #[test]
+    fn abort_login_removes_only_a_directory_this_attempt_created() {
+        let tmp = TempDir::new().unwrap();
+        let staged = tmp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("settings.json"), "{}").unwrap();
+
+        abort_login(&staged, true);
+
+        assert!(!staged.exists(), "a staged dir must not survive a failed login");
+    }
+
+    #[test]
+    fn abort_login_never_deletes_a_preexisting_directory() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join(".credentials.json"), "{}").unwrap();
+
+        abort_login(&existing, false);
+
+        assert!(existing.exists());
+        assert!(existing.join(".credentials.json").exists());
+    }
+
+    #[test]
+    fn login_profile_failure_leaves_other_profiles_byte_for_byte_intact() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"), "keep@x.com");
+        mgr.add_profile_from("keep", &src).unwrap();
+
+        let creds = mgr.profile_dir("keep").join(".credentials.json");
+        let before = fs::read(&creds).unwrap();
+        let registry_before = fs::read_to_string(&mgr.registry_path).unwrap();
+
+        // Refusing a taken name is the failure path a user hits most often.
+        assert!(mgr.login_profile("keep", false, None).is_err());
+
+        assert_eq!(fs::read(&creds).unwrap(), before);
+        assert_eq!(fs::read_to_string(&mgr.registry_path).unwrap(), registry_before);
+    }
+
     #[test]
     fn login_profile_rejects_existing_nonempty_dir() {
         let tmp = TempDir::new().unwrap();
@@ -1090,7 +1289,7 @@ mod tests {
         mgr.add_profile_from("taken", &src).unwrap();
 
         // login_profile should refuse because the dir is non-empty
-        let err = mgr.login_profile("taken", false).unwrap_err();
+        let err = mgr.login_profile("taken", false, None).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
