@@ -352,13 +352,71 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let dest_path = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        // Symlinks are checked first, and deliberately: on Unix `file_type`
+        // does not follow links, so a symlink *to a directory* reports itself
+        // as neither dir nor file. It would otherwise fall through to
+        // `fs::copy`, which fails with "the source path is neither a regular
+        // file nor a symlink to a regular file" and aborts the whole copy.
+        if file_type.is_symlink() {
+            copy_symlink(&entry.path(), &dest_path)?;
+        } else if file_type.is_dir() {
             copy_dir_all(&entry.path(), &dest_path)?;
         } else {
             fs::copy(entry.path(), dest_path)?;
         }
     }
     Ok(())
+}
+
+/// Recreate a symlink in the destination, pointing where the original pointed.
+///
+/// Linked content is kept linked rather than duplicated, so a skill symlinked
+/// out of a repository keeps tracking that repository from every profile.
+///
+/// Relative targets cannot be copied verbatim. `skills/x -> ../../repo/x`
+/// resolves against the *link's own* directory, and a profile lives somewhere
+/// else entirely — copied as-is it would silently point at nothing. So a
+/// relative target is resolved to an absolute one first.
+fn copy_symlink(link: &Path, dest: &Path) -> Result<()> {
+    let raw = fs::read_link(link)?;
+    let target = if raw.is_absolute() {
+        raw
+    } else {
+        // `canonicalize` resolves the link against its real location. It fails
+        // on a dangling link, and that is not worth failing a copy over: fall
+        // back to joining, which reproduces the same broken link rather than
+        // aborting.
+        fs::canonicalize(link)
+            .unwrap_or_else(|_| link.parent().unwrap_or(Path::new(".")).join(&raw))
+    };
+    symlink_to(&target, dest)
+        .with_context(|| format!("Failed to recreate symlink {}", dest.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_to(target: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, dest)
+}
+
+#[cfg(windows)]
+fn symlink_to(target: &Path, dest: &Path) -> std::io::Result<()> {
+    let made = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, dest)
+    } else {
+        std::os::windows::fs::symlink_file(target, dest)
+    };
+    // Windows only allows symlink creation under Developer Mode or elevation.
+    // Copying the target keeps the profile usable everywhere; it simply stops
+    // tracking the source from that point on.
+    match made {
+        Ok(()) => Ok(()),
+        Err(_) if target.is_dir() => {
+            copy_dir_all(target, dest).map_err(|e| std::io::Error::other(e.to_string()))
+        }
+        Err(_) => fs::copy(target, dest).map(|_| ()),
+    }
 }
 
 /// Extract credentials from the platform's native credential store.
@@ -615,6 +673,112 @@ mod tests {
         assert_eq!(fs::read_to_string(dst.join("root.txt")).unwrap(), "root");
         assert_eq!(fs::read_to_string(dst.join("sub/mid.txt")).unwrap(), "mid");
         assert_eq!(fs::read_to_string(dst.join("sub/deep/leaf.txt")).unwrap(), "leaf");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_all_does_not_abort_on_a_symlinked_directory() {
+        // Config directories really do contain these: linking a skill from a
+        // repository into ~/.claude/skills/ keeps the two in sync.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("skills")).unwrap();
+        let repo_skill = tmp.path().join("repo/skills/checkpoint");
+        fs::create_dir_all(&repo_skill).unwrap();
+        fs::write(repo_skill.join("SKILL.md"), "# checkpoint").unwrap();
+        std::os::unix::fs::symlink(&repo_skill, src.join("skills/checkpoint")).unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all(&src, &dst).unwrap();
+
+        let copied = dst.join("skills/checkpoint");
+        assert!(copied.is_symlink(), "the link must stay a link");
+        assert_eq!(
+            fs::read_to_string(copied.join("SKILL.md")).unwrap(),
+            "# checkpoint"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_all_absolutizes_a_relative_symlink() {
+        // `../../repo/x` resolves against the link's own directory. The copy
+        // lives elsewhere, so reproducing the target verbatim would point at
+        // nothing — silently, which is the dangerous part.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("skills")).unwrap();
+        let repo_skill = tmp.path().join("repo/skills/checkpoint");
+        fs::create_dir_all(&repo_skill).unwrap();
+        fs::write(repo_skill.join("SKILL.md"), "linked").unwrap();
+        // Relative to <tmp>/src/skills/.
+        std::os::unix::fs::symlink("../../repo/skills/checkpoint", src.join("skills/checkpoint"))
+            .unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all(&src, &dst).unwrap();
+
+        let copied = dst.join("skills/checkpoint");
+        assert!(fs::read_link(&copied).unwrap().is_absolute());
+        assert_eq!(fs::read_to_string(copied.join("SKILL.md")).unwrap(), "linked");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_all_preserves_an_absolute_symlink_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let target = tmp.path().join("elsewhere/notes.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "notes").unwrap();
+        std::os::unix::fs::symlink(&target, src.join("notes.md")).unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all(&src, &dst).unwrap();
+
+        assert_eq!(fs::read_link(dst.join("notes.md")).unwrap(), target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_all_reproduces_a_dangling_symlink_instead_of_failing() {
+        // A broken link in ~/.claude is the user's existing state. Copying it
+        // faithfully is honest; refusing to create the profile is not.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all(&src, &dst).unwrap();
+
+        let copied = dst.join("dangling");
+        assert!(copied.is_symlink());
+        assert!(!copied.exists(), "still dangling, as it was");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_all_does_not_duplicate_linked_content() {
+        // The point of keeping the link: edits at the source reach the copy,
+        // instead of the copy freezing a stale duplicate.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("skills")).unwrap();
+        let repo_skill = tmp.path().join("repo/skills/checkpoint");
+        fs::create_dir_all(&repo_skill).unwrap();
+        fs::write(repo_skill.join("SKILL.md"), "v1").unwrap();
+        std::os::unix::fs::symlink(&repo_skill, src.join("skills/checkpoint")).unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all(&src, &dst).unwrap();
+        fs::write(repo_skill.join("SKILL.md"), "v2").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dst.join("skills/checkpoint/SKILL.md")).unwrap(),
+            "v2"
+        );
     }
 
     // ── Registry I/O ──────────────────────────────────────────────────────────
