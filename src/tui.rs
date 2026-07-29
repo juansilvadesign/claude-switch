@@ -251,7 +251,7 @@ impl App {
                 if name.is_empty() {
                     return Ok(false);
                 }
-                match self.manager.add_profile(&name) {
+                match self.manager.add_profile(&name, false) {
                     Ok(_) => {
                         self.refresh()?;
                         self.select_by_name(&name);
@@ -275,7 +275,9 @@ impl App {
                     return Ok(false);
                 }
                 ratatui::restore();
-                self.manager.login_profile(&name)?;
+                let outcome = self.manager.login_profile(&name, false, None)?;
+                crate::report_login(&name, &outcome);
+                return Ok(true);
             }
 
             KeyCode::Backspace => {
@@ -341,7 +343,7 @@ impl App {
                     let name = p.name.clone();
                     ratatui::restore();
                     println!("Refreshing profile '{}'…", name);
-                    match self.manager.add_profile_force(&name) {
+                    match self.manager.add_profile_force(&name, false) {
                         Ok(_) => println!("Profile '{}' refreshed from current ~/.claude", name),
                         Err(e) => eprintln!("Error: {}", e),
                     }
@@ -422,7 +424,7 @@ impl App {
                     self.mode = Mode::Normal;
                     return Ok(false);
                 }
-                match self.manager.add_profile(&name) {
+                match self.manager.add_profile(&name, false) {
                     Ok(_) => {
                         self.refresh()?;
                         self.select_by_name(&name);
@@ -452,7 +454,9 @@ impl App {
                     return Ok(false);
                 }
                 ratatui::restore();
-                self.manager.login_profile(&name)?;
+                let outcome = self.manager.login_profile(&name, false, None)?;
+                crate::report_login(&name, &outcome);
+                return Ok(true);
             }
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Backspace => {

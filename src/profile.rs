@@ -20,6 +20,24 @@ pub struct Registry {
     pub profiles: HashMap<String, Profile>,
 }
 
+/// The verified result of a completed `login_profile`.
+///
+/// `email` is what Claude reported after authenticating — never what the user
+/// typed. `same_account_as` lists profiles already registered to that same
+/// account, so the caller can say "this is the account you already had"
+/// instead of implying a new one was added.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoginOutcome {
+    pub email: Option<String>,
+    pub same_account_as: Vec<String>,
+}
+
+impl LoginOutcome {
+    pub fn display_email(&self) -> &str {
+        self.email.as_deref().unwrap_or("unknown account")
+    }
+}
+
 // ── ProfileManager ────────────────────────────────────────────────────────────
 
 pub struct ProfileManager {
@@ -67,29 +85,44 @@ impl ProfileManager {
 
     /// Add a profile from an explicit source directory.
     /// Used both by `add_profile` (which sources `~/.claude`) and by tests.
-    pub fn add_profile_from(&self, name: &str, src: &Path) -> Result<Profile> {
-        if !src.exists() {
-            bail!("Source directory '{}' does not exist.", src.display());
-        }
-        let dest = self.profiles_dir.join(name);
-        if dest.exists() {
-            bail!("Profile '{}' already exists. Use --force to overwrite.", name);
-        }
-        let profile = self.copy_and_build_profile(name, src)?;
-        self.upsert_profile(profile.clone())?;
-        Ok(profile)
+    pub fn add_profile_from(
+        &self,
+        name: &str,
+        src: &Path,
+        include_history: bool,
+    ) -> Result<Profile> {
+        self.add_profile_from_impl(name, src, include_history, false)
     }
 
     /// Same as `add_profile_from` but overwrites an existing profile.
-    pub fn add_profile_from_force(&self, name: &str, src: &Path) -> Result<Profile> {
+    pub fn add_profile_from_force(
+        &self,
+        name: &str,
+        src: &Path,
+        include_history: bool,
+    ) -> Result<Profile> {
+        self.add_profile_from_impl(name, src, include_history, true)
+    }
+
+    fn add_profile_from_impl(
+        &self,
+        name: &str,
+        src: &Path,
+        include_history: bool,
+        force: bool,
+    ) -> Result<Profile> {
         if !src.exists() {
             bail!("Source directory '{}' does not exist.", src.display());
         }
         let dest = self.profiles_dir.join(name);
         if dest.exists() {
-            fs::remove_dir_all(&dest)?;
+            if force {
+                fs::remove_dir_all(&dest)?;
+            } else {
+                bail!("Profile '{}' already exists. Use --force to overwrite.", name);
+            }
         }
-        let profile = self.copy_and_build_profile(name, src)?;
+        let profile = self.copy_and_build_profile(name, src, include_history)?;
         self.upsert_profile(profile.clone())?;
         Ok(profile)
     }
@@ -97,25 +130,25 @@ impl ProfileManager {
     /// Add the current logged-in session as a named profile.
     /// Copies `~/.claude/` dir, `~/.claude.json` (home root), and on macOS
     /// extracts Keychain credentials into `.credentials.json`.
-    pub fn add_profile(&self, name: &str) -> Result<Profile> {
+    pub fn add_profile(&self, name: &str, include_history: bool) -> Result<Profile> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let src = home.join(".claude");
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        let mut profile = self.add_profile_from(name, &src)?;
+        let mut profile = self.add_profile_from(name, &src, include_history)?;
         self.copy_extra_credentials(&home, name, &mut profile)?;
         Ok(profile)
     }
 
     /// Same as `add_profile` but overwrites an existing profile.
-    pub fn add_profile_force(&self, name: &str) -> Result<Profile> {
+    pub fn add_profile_force(&self, name: &str, include_history: bool) -> Result<Profile> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let src = home.join(".claude");
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        let mut profile = self.add_profile_from_force(name, &src)?;
+        let mut profile = self.add_profile_from_force(name, &src, include_history)?;
         self.copy_extra_credentials(&home, name, &mut profile)?;
         Ok(profile)
     }
@@ -207,26 +240,113 @@ impl ProfileManager {
     /// Claude will detect no credentials and trigger its own login flow.
     /// After the user authenticates and exits Claude, we read the email
     /// from whatever config Claude wrote and register the profile.
-    pub fn login_profile(&self, name: &str) -> Result<()> {
+    pub fn login_profile(
+        &self,
+        name: &str,
+        include_history: bool,
+        email_hint: Option<&str>,
+    ) -> Result<LoginOutcome> {
         let profile_dir = self.profiles_dir.join(name);
-        if profile_dir.exists() {
-            let has_files = profile_dir.read_dir()?.next().is_some();
-            if has_files {
-                bail!("Profile '{}' already exists. Remove it first or pick a different name.", name);
-            }
+        // Never authenticate into a directory we did not just create: a
+        // half-written login must not be able to clobber a working profile.
+        let we_created_dir = !profile_dir.exists();
+        if !we_created_dir && profile_dir.read_dir()?.next().is_some() {
+            bail!(
+                "Profile '{}' already exists and holds an account. Delete it first \
+                 (cswitch remove {}) or pick a different name.",
+                name,
+                name
+            );
         }
         fs::create_dir_all(&profile_dir)?;
 
-        println!("Launching Claude Code — please log in with the account for profile '{}'.", name);
-        println!("After logging in, exit Claude (Ctrl-C or /exit) to finish setup.\n");
+        // Any early return past this point must not leave a staged directory
+        // behind, so failures funnel through `abort_login`.
+        let seeded = match self.seed_profile_dir(&profile_dir, include_history) {
+            Ok(seeded) => seeded,
+            Err(e) => {
+                abort_login(&profile_dir, we_created_dir);
+                return Err(e);
+            }
+        };
 
-        let status = std::process::Command::new("claude")
+        if seeded {
+            println!(
+                "Seeded '{}' from your current setup (settings, skills, project trust).",
+                name
+            );
+            println!("Conversation history and session transcripts were not copied.\n");
+        }
+
+        println!(
+            "Opening your browser — sign in as the account for profile '{}'.",
+            name
+        );
+        // The OAuth grant follows the *browser's* claude.ai session, not this
+        // directory. A signed-in browser authorises that account with no
+        // picker, which is precisely how a "new" profile ends up cloning the
+        // one you already had.
+        println!(
+            "  If claude.ai is already signed in as another account, sign out first\n  \
+             or complete this login in a private window.\n"
+        );
+
+        // `claude auth login` is the purpose-built flow: it opens the browser,
+        // waits for the OAuth round-trip, and exits. Launching the full TUI
+        // instead would leave the user to remember `/exit`, and would trip
+        // Claude's nested-session guard when run from inside a Claude session.
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args(["auth", "login"]);
+        // `--email` only pre-fills the login page; it does not override a live
+        // browser session. Treated as a convenience, never as a guarantee.
+        if let Some(hint) = email_hint.map(str::trim).filter(|h| !h.is_empty()) {
+            cmd.args(["--email", hint]);
+        }
+        let status = cmd
             .env("CLAUDE_CONFIG_DIR", &profile_dir)
             .status()
-            .context("Failed to launch claude. Is it installed and in your PATH?")?;
+            .context("Failed to launch claude. Is it installed and in your PATH?");
 
-        // Claude has exited — check if it wrote any config files
-        let email = read_email_from_dir(&profile_dir);
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
+                abort_login(&profile_dir, we_created_dir);
+                return Err(e);
+            }
+        };
+
+        if !status.success() {
+            abort_login(&profile_dir, we_created_dir);
+            bail!(
+                "Login did not complete for profile '{}'. Nothing was registered — \
+                 retry with: cswitch login {}",
+                name,
+                name
+            );
+        }
+
+        // Ask Claude who it ended up as, rather than re-parsing the config we
+        // just sanitized. A clean exit code is not proof of a session: a
+        // dismissed browser tab also exits zero.
+        let email = read_account_email(&profile_dir).or_else(|| read_email_from_dir(&profile_dir));
+        if email.is_none() {
+            abort_login(&profile_dir, we_created_dir);
+            bail!(
+                "Claude exited without an authenticated session, so profile '{}' was \
+                 not registered. Retry with: cswitch login {}",
+                name,
+                name
+            );
+        }
+
+        // The same Claude account under two profile names is legitimate
+        // (isolated settings, separate MCP trust), so this warns rather than
+        // fails.
+        let same_account_as = match email.as_deref() {
+            Some(e) => self.profiles_with_email(e)?,
+            None => Vec::new(),
+        };
+
         let profile = Profile {
             name: name.to_string(),
             email: email.clone(),
@@ -235,11 +355,7 @@ impl ProfileManager {
         };
         self.upsert_profile(profile)?;
 
-        let display_email = email.as_deref().unwrap_or("unknown");
-        println!("\nProfile '{}' registered (account: {}).", name, display_email);
-        println!("Launch with: cswitch use {}", name);
-
-        std::process::exit(status.code().unwrap_or(0));
+        Ok(LoginOutcome { email, same_account_as })
     }
 
     /// Print shell alias/function lines for all managed profiles.
@@ -306,11 +422,77 @@ impl ProfileManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn copy_and_build_profile(&self, name: &str, src: &Path) -> Result<Profile> {
+    fn copy_and_build_profile(
+        &self,
+        name: &str,
+        src: &Path,
+        include_history: bool,
+    ) -> Result<Profile> {
         let dest = self.profiles_dir.join(name);
-        copy_dir_all(src, &dest)?;
+        copy_dir_all_filtered(src, &dest, &seed_skip(include_history))?;
         let email = read_email_from_dir(&dest);
         Ok(Profile { name: name.to_string(), email, added: Utc::now(), last_used: None })
+    }
+
+    /// Seed a profile directory with the current setup, then strip the old
+    /// identity so Claude has to authenticate again.
+    ///
+    /// An empty profile dir is a blank Claude Code: `CLAUDE_CONFIG_DIR`
+    /// relocates `.claude.json` too, not just credentials, so every project's
+    /// MCP servers drop back to "pending approval", per-directory trust is
+    /// gone, and settings and skills are missing.
+    ///
+    /// Safety property: the credential file is always removed. Even if a
+    /// future Claude version introduces an identity key this code does not
+    /// know about, the profile still cannot authenticate as the old account —
+    /// Claude has to re-authenticate and overwrites the stale metadata itself.
+    ///
+    /// Returns whether anything was actually seeded.
+    fn seed_profile_dir(&self, profile_dir: &Path, include_history: bool) -> Result<bool> {
+        let Some(home) = dirs::home_dir() else {
+            return Ok(false);
+        };
+        let src = home.join(".claude");
+        if !src.exists() {
+            return Ok(false);
+        }
+
+        copy_dir_all_filtered(&src, profile_dir, &seed_skip(include_history))?;
+
+        // Account metadata lives at the home root, not inside ~/.claude.
+        let home_claude_json = home.join(".claude.json");
+        if home_claude_json.exists() {
+            fs::copy(&home_claude_json, profile_dir.join(".claude.json"))?;
+        }
+
+        // Force a fresh login: no credentials, no stale identity.
+        let creds = profile_dir.join(".credentials.json");
+        if creds.exists() {
+            fs::remove_file(&creds)?;
+        }
+        sanitize_claude_json(&profile_dir.join(".claude.json"))?;
+
+        Ok(true)
+    }
+
+    /// Names of already-registered profiles authenticated as `email`.
+    /// Case-insensitive: Claude echoes the address as the user typed it.
+    pub fn profiles_with_email(&self, email: &str) -> Result<Vec<String>> {
+        let target = email.trim().to_lowercase();
+        let mut names: Vec<String> = self
+            .load_registry()?
+            .profiles
+            .into_values()
+            .filter(|p| {
+                p.email
+                    .as_deref()
+                    .map(|e| e.trim().to_lowercase() == target)
+                    .unwrap_or(false)
+            })
+            .map(|p| p.name)
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     fn upsert_profile(&self, profile: Profile) -> Result<()> {
@@ -347,11 +529,20 @@ pub fn detect_current_account() -> Option<DetectedAccount> {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+/// Copy a directory tree, skipping named entries at the **top level only**.
+///
+/// Nested occurrences are kept: skipping `sessions` must not also drop
+/// `projects/<id>/sessions`, which is unrelated content that happens to share
+/// a name.
+fn copy_dir_all_filtered(src: &Path, dst: &Path, skip_top_level: &[&str]) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let dest_path = dst.join(entry.file_name());
+        let name = entry.file_name();
+        if skip_top_level.iter().any(|s| name == *s) {
+            continue;
+        }
+        let dest_path = dst.join(&name);
         let file_type = entry.file_type()?;
         // Symlinks are checked first, and deliberately: on Unix `file_type`
         // does not follow links, so a symlink *to a directory* reports itself
@@ -361,12 +552,126 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         if file_type.is_symlink() {
             copy_symlink(&entry.path(), &dest_path)?;
         } else if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &dest_path)?;
+            copy_dir_all_filtered(&entry.path(), &dest_path, &[])?;
         } else {
             fs::copy(entry.path(), dest_path)?;
         }
     }
     Ok(())
+}
+
+// ── Warm-state seeding ────────────────────────────────────────────────────────
+
+/// Conversation content. Skipped by default so a new profile starts with a
+/// clean session list; `--include-history` keeps it.
+///
+/// Separating a profile's sessions is usually the *point* — but someone who
+/// relies on `claude --resume` across a switch can opt back in.
+const SEED_SKIP_HISTORY: &[&str] = &[
+    "projects",      // session transcripts (NOT the .claude.json "projects" key)
+    "history.jsonl", // every prompt ever typed
+    "file-history",
+    "todos",
+];
+
+/// Machine-local caches and runtime state. Never copied, under any flag —
+/// stale here at best, confusing at worst.
+const SEED_SKIP_ALWAYS: &[&str] = &[
+    "sessions",
+    "session-env",
+    "shell-snapshots",
+    "paste-cache",
+    "tasks",
+    "jobs",
+    "daemon",
+    "daemon.log",
+    "backups",
+    "telemetry",
+    "cache",
+    "ide",
+    "statsig",
+];
+
+/// Build the skip list for a seed operation.
+fn seed_skip(include_history: bool) -> Vec<&'static str> {
+    let mut skip = SEED_SKIP_ALWAYS.to_vec();
+    if !include_history {
+        skip.extend_from_slice(SEED_SKIP_HISTORY);
+    }
+    skip
+}
+
+/// Keys stripped from a seeded `.claude.json` when the profile is going to
+/// hold a *different* account.
+///
+/// `projects` is deliberately absent — it holds the per-directory trust and
+/// MCP-approval state that makes a profile warm, and none of it identifies an
+/// account.
+const IDENTITY_KEYS: &[&str] = &[
+    "oauthAccount",             // email, org, account uuid, billing type
+    "userID",                   // per-account analytics id; Claude regenerates it
+    "orgModelDefaultCache",     // org-scoped
+    "penguinModeOrgEnabled",    // org-scoped
+    "claudeAiMcpEverConnected", // account-bound connector list
+    "cachedUsageUtilization",
+    "cachedExtraUsageDisabledReason",
+    "modelAccessCache",
+    "additionalModelCostsCache",
+    "additionalModelOptionsCache",
+];
+
+/// Remove the keys identifying a specific Claude account from a profile's
+/// `.claude.json`, leaving the warm state intact. No-op if the file is missing
+/// or unparseable — a profile without one simply logs in from scratch.
+fn sanitize_claude_json(path: &Path) -> Result<()> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ok(());
+    };
+    if let Some(obj) = val.as_object_mut() {
+        for key in IDENTITY_KEYS {
+            obj.remove(*key);
+        }
+    }
+    fs::write(path, serde_json::to_string_pretty(&val)?)?;
+    Ok(())
+}
+
+/// Roll back a failed login attempt.
+///
+/// Only removes the staging directory when *this* attempt created it, so a
+/// cancelled login can never delete a directory that already existed. Cleanup
+/// failure is deliberately swallowed: the caller is already reporting the real
+/// error, and a leftover directory is recoverable while a masked cause is not.
+fn abort_login(profile_dir: &Path, we_created_dir: bool) {
+    if we_created_dir {
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+}
+
+/// Ask Claude which account a profile is actually authenticated as.
+///
+/// This is the only trustworthy source of a profile's identity: config
+/// metadata can be stale, and a successful exit code is not proof of a
+/// session.
+fn read_account_email(profile_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .args(["auth", "status", "--json"])
+        .env("CLAUDE_CONFIG_DIR", profile_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    if val.get("loggedIn").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    val.get("email")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Recreate a symlink in the destination, pointing where the original pointed.
@@ -652,7 +957,7 @@ mod tests {
         fs::write(src.join("b.txt"), "world").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
         assert_eq!(fs::read_to_string(dst.join("b.txt")).unwrap(), "world");
@@ -668,7 +973,7 @@ mod tests {
         fs::write(src.join("sub/deep").join("leaf.txt"), "leaf").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         assert_eq!(fs::read_to_string(dst.join("root.txt")).unwrap(), "root");
         assert_eq!(fs::read_to_string(dst.join("sub/mid.txt")).unwrap(), "mid");
@@ -689,7 +994,7 @@ mod tests {
         std::os::unix::fs::symlink(&repo_skill, src.join("skills/checkpoint")).unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         let copied = dst.join("skills/checkpoint");
         assert!(copied.is_symlink(), "the link must stay a link");
@@ -716,7 +1021,7 @@ mod tests {
             .unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         let copied = dst.join("skills/checkpoint");
         assert!(fs::read_link(&copied).unwrap().is_absolute());
@@ -735,7 +1040,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, src.join("notes.md")).unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         assert_eq!(fs::read_link(dst.join("notes.md")).unwrap(), target);
     }
@@ -751,7 +1056,7 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         let copied = dst.join("dangling");
         assert!(copied.is_symlink());
@@ -772,13 +1077,170 @@ mod tests {
         std::os::unix::fs::symlink(&repo_skill, src.join("skills/checkpoint")).unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all(&src, &dst).unwrap();
+        copy_dir_all_filtered(&src, &dst, &[]).unwrap();
         fs::write(repo_skill.join("SKILL.md"), "v2").unwrap();
 
         assert_eq!(
             fs::read_to_string(dst.join("skills/checkpoint/SKILL.md")).unwrap(),
             "v2"
         );
+    }
+
+    // ── Warm-state seeding ────────────────────────────────────────────────────
+
+    #[test]
+    fn copy_dir_all_filtered_skips_only_the_top_level() {
+        // Skipping "sessions" must not also drop projects/x/sessions, which is
+        // unrelated content that happens to share a name.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sessions")).unwrap();
+        fs::create_dir_all(src.join("projects/x/sessions")).unwrap();
+        fs::write(src.join("sessions/live.json"), "top").unwrap();
+        fs::write(src.join("projects/x/sessions/keep.json"), "nested").unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all_filtered(&src, &dst, &["sessions"]).unwrap();
+
+        assert!(!dst.join("sessions").exists(), "top-level entry is skipped");
+        assert_eq!(
+            fs::read_to_string(dst.join("projects/x/sessions/keep.json")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[test]
+    fn adding_a_profile_does_not_copy_conversation_history() {
+        // Transcripts and prompt history are private, and separate sessions
+        // per profile are usually the point of having profiles at all.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake"), "me@work.com");
+        fs::create_dir_all(src.join("projects")).unwrap();
+        fs::write(src.join("projects/session.jsonl"), "private conversation").unwrap();
+        fs::write(src.join("history.jsonl"), "every prompt").unwrap();
+        fs::create_dir_all(src.join("skills/mine")).unwrap();
+        fs::write(src.join("skills/mine/SKILL.md"), "warm").unwrap();
+
+        mgr.add_profile_from("work", &src, false).unwrap();
+        let dest = mgr.profile_dir("work");
+
+        assert!(!dest.join("projects").exists());
+        assert!(!dest.join("history.jsonl").exists());
+        // ...while the things that make a profile warm are still there.
+        assert_eq!(
+            fs::read_to_string(dest.join("skills/mine/SKILL.md")).unwrap(),
+            "warm"
+        );
+        assert!(dest.join(".claude.json").exists());
+    }
+
+    #[test]
+    fn machine_local_caches_are_never_copied() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake"), "me@work.com");
+        for junk in ["sessions", "shell-snapshots", "statsig", "cache", "ide"] {
+            fs::create_dir_all(src.join(junk)).unwrap();
+            fs::write(src.join(junk).join("x"), "stale").unwrap();
+        }
+
+        mgr.add_profile_from("work", &src, false).unwrap();
+        let dest = mgr.profile_dir("work");
+
+        for junk in ["sessions", "shell-snapshots", "statsig", "cache", "ide"] {
+            assert!(!dest.join(junk).exists(), "{junk} must not be copied");
+        }
+    }
+
+    #[test]
+    fn seed_skip_drops_history_unless_asked_for_it() {
+        assert!(seed_skip(false).contains(&"history.jsonl"));
+        assert!(seed_skip(false).contains(&"projects"));
+        assert!(!seed_skip(true).contains(&"history.jsonl"));
+        assert!(!seed_skip(true).contains(&"projects"));
+        // Machine-local state is skipped either way.
+        assert!(seed_skip(true).contains(&"sessions"));
+    }
+
+    #[test]
+    fn sanitize_claude_json_strips_identity_but_keeps_warm_state() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".claude.json");
+        let original = serde_json::json!({
+            "oauthAccount": { "emailAddress": "old@example.com" },
+            "userID": "analytics-id",
+            "modelAccessCache": { "stale": true },
+            // Per-directory trust and MCP approvals — warm state, not identity.
+            "projects": { "/home/me/repo": { "hasTrustDialogAccepted": true } },
+            "hasCompletedOnboarding": true
+        });
+        fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        sanitize_claude_json(&path).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after.get("oauthAccount").is_none());
+        assert!(after.get("userID").is_none());
+        assert!(after.get("modelAccessCache").is_none());
+        assert!(after.get("projects").is_some(), "trust state must survive");
+        assert_eq!(after.get("hasCompletedOnboarding"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn sanitize_claude_json_is_a_no_op_on_a_missing_or_broken_file() {
+        let tmp = TempDir::new().unwrap();
+        sanitize_claude_json(&tmp.path().join("absent.json")).unwrap();
+
+        let broken = tmp.path().join("broken.json");
+        fs::write(&broken, "{ not json").unwrap();
+        sanitize_claude_json(&broken).unwrap();
+        assert_eq!(fs::read_to_string(&broken).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn profiles_with_email_matches_case_and_padding_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        for (name, email) in [
+            ("work", Some("Me@Work.com ")),
+            ("review", Some("me@work.com")),
+            ("other", Some("someone@else.com")),
+            ("unknown", None),
+        ] {
+            mgr.upsert_profile(Profile {
+                name: name.to_string(),
+                email: email.map(String::from),
+                added: Utc::now(),
+                last_used: None,
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            mgr.profiles_with_email("ME@WORK.COM").unwrap(),
+            vec!["review".to_string(), "work".to_string()]
+        );
+        assert!(mgr.profiles_with_email("nobody@nowhere.com").unwrap().is_empty());
+    }
+
+    #[test]
+    fn profiles_with_unknown_email_never_match_each_other() {
+        // Two profiles whose email could not be read are not thereby "the same
+        // account" — that would produce a confidently wrong warning.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        for name in ["a", "b"] {
+            mgr.upsert_profile(Profile {
+                name: name.to_string(),
+                email: None,
+                added: Utc::now(),
+                last_used: None,
+            })
+            .unwrap();
+        }
+        assert!(mgr.profiles_with_email("").unwrap().is_empty());
     }
 
     // ── Registry I/O ──────────────────────────────────────────────────────────
@@ -822,7 +1284,7 @@ mod tests {
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "u@test.com");
 
-        mgr.add_profile_from("work", &src).unwrap();
+        mgr.add_profile_from("work", &src, false).unwrap();
 
         let dest = mgr.profile_dir("work");
         assert!(dest.join(".claude.json").exists(), ".claude.json missing");
@@ -835,7 +1297,7 @@ mod tests {
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "email@test.com");
 
-        let p = mgr.add_profile_from("personal", &src).unwrap();
+        let p = mgr.add_profile_from("personal", &src, false).unwrap();
 
         assert_eq!(p.email.as_deref(), Some("email@test.com"));
     }
@@ -846,7 +1308,7 @@ mod tests {
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "x@y.com");
 
-        mgr.add_profile_from("slot", &src).unwrap();
+        mgr.add_profile_from("slot", &src, false).unwrap();
 
         let reg = mgr.load_registry().unwrap();
         assert!(reg.profiles.contains_key("slot"));
@@ -862,7 +1324,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("something-unrelated.txt"), "hi").unwrap();
 
-        let p = mgr.add_profile_from("mystery", &src).unwrap();
+        let p = mgr.add_profile_from("mystery", &src, false).unwrap();
         assert!(p.email.is_none());
     }
 
@@ -871,7 +1333,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let err = mgr
-            .add_profile_from("bad", &tmp.path().join("does-not-exist"))
+            .add_profile_from("bad", &tmp.path().join("does-not-exist"), false)
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
@@ -882,8 +1344,8 @@ mod tests {
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "a@b.com");
 
-        mgr.add_profile_from("dup", &src).unwrap();
-        let err = mgr.add_profile_from("dup", &src).unwrap_err();
+        mgr.add_profile_from("dup", &src, false).unwrap();
+        let err = mgr.add_profile_from("dup", &src, false).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
@@ -895,11 +1357,11 @@ mod tests {
         let mgr = make_manager(&tmp);
 
         let src = make_claude_dir(&tmp.path().join("v1"), "first@test.com");
-        mgr.add_profile_from("slot", &src).unwrap();
+        mgr.add_profile_from("slot", &src, false).unwrap();
 
         // Change source to a different account
         let src2 = make_claude_dir(&tmp.path().join("v2"), "second@test.com");
-        mgr.add_profile_from_force("slot", &src2).unwrap();
+        mgr.add_profile_from_force("slot", &src2, false).unwrap();
 
         let reg = mgr.load_registry().unwrap();
         assert_eq!(reg.profiles["slot"].email.as_deref(), Some("second@test.com"));
@@ -914,7 +1376,7 @@ mod tests {
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "new@test.com");
 
-        let p = mgr.add_profile_from_force("brand-new", &src).unwrap();
+        let p = mgr.add_profile_from_force("brand-new", &src, false).unwrap();
         assert_eq!(p.name, "brand-new");
         assert_eq!(p.email.as_deref(), Some("new@test.com"));
     }
@@ -938,7 +1400,7 @@ mod tests {
                 &tmp.path().join(format!("src-{name}")),
                 &format!("{name}@test.com"),
             );
-            mgr.add_profile_from(name, &src).unwrap();
+            mgr.add_profile_from(name, &src, false).unwrap();
         }
 
         let profiles = mgr.list_profiles().unwrap();
@@ -953,7 +1415,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "del@test.com");
-        mgr.add_profile_from("to-delete", &src).unwrap();
+        mgr.add_profile_from("to-delete", &src, false).unwrap();
 
         mgr.remove_profile("to-delete").unwrap();
 
@@ -976,7 +1438,7 @@ mod tests {
 
         for name in &["keep", "delete-me"] {
             let src = make_claude_dir(&tmp.path().join(name), &format!("{name}@x.com"));
-            mgr.add_profile_from(name, &src).unwrap();
+            mgr.add_profile_from(name, &src, false).unwrap();
         }
 
         mgr.remove_profile("delete-me").unwrap();
@@ -993,7 +1455,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "found@test.com");
-        mgr.add_profile_from("found", &src).unwrap();
+        mgr.add_profile_from("found", &src, false).unwrap();
 
         let p = mgr.get_profile("found").unwrap();
         assert_eq!(p.name, "found");
@@ -1034,7 +1496,7 @@ mod tests {
 
         for name in &["work", "personal"] {
             let src = make_claude_dir(&tmp.path().join(name), &format!("{name}@x.com"));
-            mgr.add_profile_from(name, &src).unwrap();
+            mgr.add_profile_from(name, &src, false).unwrap();
         }
 
         let out = mgr.generate_aliases().unwrap();
@@ -1050,10 +1512,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake-claude"), "a@b.com");
-        mgr.add_profile_from("taken", &src).unwrap();
+        mgr.add_profile_from("taken", &src, false).unwrap();
 
         // login_profile should refuse because the dir is non-empty
-        let err = mgr.login_profile("taken").unwrap_err();
+        let err = mgr.login_profile("taken", false, None).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
@@ -1090,7 +1552,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let src = make_claude_dir(&tmp.path().join("fake"), "me@work.com");
-        mgr.add_profile_from("work", &src).unwrap();
+        mgr.add_profile_from("work", &src, false).unwrap();
 
         let out = mgr.generate_aliases().unwrap();
         assert!(out.contains("# me@work.com"), "{out}");

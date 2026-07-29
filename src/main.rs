@@ -3,7 +3,7 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use profile::{detect_current_account, ProfileManager};
+use profile::{detect_current_account, LoginOutcome, ProfileManager};
 use std::io::{self, Write};
 
 #[derive(Parser)]
@@ -42,12 +42,24 @@ enum Commands {
         /// Overwrite if profile already exists
         #[arg(short, long)]
         force: bool,
+        /// Also copy conversation history and session transcripts.
+        /// Off by default: separate sessions per profile are usually the point.
+        #[arg(long)]
+        include_history: bool,
     },
 
     /// Log in to a new Claude account and save it as a profile (skips detection prompt)
     Login {
         /// Profile name (alphanumeric, hyphens, underscores)
         name: String,
+        /// Also copy conversation history and session transcripts.
+        /// Off by default: separate sessions per profile are usually the point.
+        #[arg(long)]
+        include_history: bool,
+        /// Pre-fill this address on Claude's login page. A convenience only —
+        /// the account granted is whichever one the browser is signed in as.
+        #[arg(long)]
+        email: Option<String>,
     },
 
     /// Remove a saved profile
@@ -105,12 +117,13 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Add { name, force }) => {
-            handle_add(&manager, &name, force)?;
+        Some(Commands::Add { name, force, include_history }) => {
+            handle_add(&manager, &name, force, include_history)?;
         }
 
-        Some(Commands::Login { name }) => {
-            manager.login_profile(&name)?;
+        Some(Commands::Login { name, include_history, email }) => {
+            let outcome = manager.login_profile(&name, include_history, email.as_deref())?;
+            report_login(&name, &outcome);
         }
 
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
@@ -158,7 +171,40 @@ fn main() -> Result<()> {
 
 /// Smart add: detects an active Claude session and asks the user whether to
 /// copy it or login fresh.
-fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
+/// Report a completed login: the account Claude actually authenticated as,
+/// and whether another profile already holds it.
+///
+/// The email is read back from Claude, never from the name the user typed, so
+/// this can contradict what they expected — which is the whole point.
+pub(crate) fn report_login(name: &str, outcome: &LoginOutcome) {
+    println!("\nProfile '{}' registered.", name);
+    println!("  Account: {}", outcome.display_email());
+
+    let others: Vec<&str> = outcome
+        .same_account_as
+        .iter()
+        .map(String::as_str)
+        .filter(|n| *n != name)
+        .collect();
+    if !others.is_empty() {
+        println!(
+            "\n  Note: that is the same account as {}.",
+            others.join(", ")
+        );
+        println!("  Allowed — two profiles can isolate settings for one account.");
+        println!("  If you wanted a different account, the browser session decided:");
+        println!("  sign out of claude.ai (or use a private window) and try again.");
+    }
+
+    println!("\n  Launch with: cswitch use {}", name);
+}
+
+fn handle_add(
+    manager: &ProfileManager,
+    name: &str,
+    force: bool,
+    include_history: bool,
+) -> Result<()> {
     match detect_current_account() {
         Some(acct) => {
             let email = acct.email.as_deref().unwrap_or("unknown");
@@ -172,9 +218,9 @@ fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
             match choice {
                 'c' => {
                     let result = if force {
-                        manager.add_profile_force(name)
+                        manager.add_profile_force(name, include_history)
                     } else {
-                        manager.add_profile(name)
+                        manager.add_profile(name, include_history)
                     };
                     match result {
                         Ok(p) => {
@@ -191,7 +237,8 @@ fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
                     }
                 }
                 'l' => {
-                    manager.login_profile(name)?;
+                    let outcome = manager.login_profile(name, include_history, None)?;
+                    report_login(name, &outcome);
                 }
                 _ => unreachable!(),
             }
@@ -199,7 +246,8 @@ fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
         None => {
             // No active session — go straight to login
             println!("No active Claude session found. Opening Claude for login…\n");
-            manager.login_profile(name)?;
+            let outcome = manager.login_profile(name, include_history, None)?;
+            report_login(name, &outcome);
         }
     }
     Ok(())
