@@ -201,8 +201,9 @@ The workspace's 93 skill symlinks live at `ai-synthesizer/.claude/skills/`. They
    - macOS Keychain and Windows Credential Manager credential handling (the original scope).
    - `symlink_to`'s Windows fallback. Windows refuses to create symlinks without Developer Mode or elevation, so it copies the target instead. Never run on a real Windows box.
    - The live-session guard is pure `fs::metadata` and needs no platform work, but whether its *warning* is useful on Windows is untested.
-2. **Decide what to do about the two mislabelled commits.** `6603736` and `bb803ed` are the live-session guard and symlink fix, but their messages describe "cwd-aware profile switching and path mapping" — a feature that does not exist in this repo. The branch is already pushed to `origin`, so correcting them means a force-push.
-3. **Version and release.** `Cargo.toml` is still `0.1.0` and `CHANGELOG.md` is `[Unreleased]`. Note that the branch tracks `upstream/main` (Abhishek21k), not `origin/main` — worth fixing before any push goes to the wrong place.
+2. **Version and release.** `Cargo.toml` is still `0.1.0` and `CHANGELOG.md` is `[Unreleased]`. Note that the branch tracks `upstream/main` (Abhishek21k), **not** `origin/main` — a bare `git push` aims at the wrong repository, so name the remote until that is fixed.
+
+**Resolved 2026-07-29 — the two mislabelled commits.** `6603736` and `bb803ed` claimed "cwd-aware profile switching and path mapping", a feature that does not exist here; they actually held the live-session guard and the symlink fix. Rewritten as four commits that say what they contain — guard, symlink fix, `cargo fmt`, docs — and force-pushed. The split was verified by diffing the reconstructed pre-`fmt` tree against the original commit: byte-identical, nothing lost. `backup-before-reword` still points at the old `bb803ed`; delete it once you are satisfied.
 
 ## Environment notes
 
