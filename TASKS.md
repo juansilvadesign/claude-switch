@@ -197,14 +197,46 @@ The workspace's 93 skill symlinks live at `ai-synthesizer/.claude/skills/`. They
 
 - [x] **Symlinks in the config directory — found here, fixed.** `copy_dir_all_filtered` tested `is_dir()` before `is_symlink()`. `DirEntry::file_type()` does not follow links on Unix, so a symlink-to-directory reported neither, fell through to `fs::copy`, and aborted the entire profile creation. Reproduced against the real binary before the fix — a linked skill directory gave `the source path is neither a regular file nor a symlink to a regular file`, and a dangling link gave `No such file or directory`. Links are now recreated as links, with relative targets resolved to absolute (a profile lives elsewhere, so `../../repo/x` would silently point at nothing). Verified end-to-end: `cswitch add` succeeds, the linked skill resolves from the profile, edits at the source propagate, and a dangling link stays dangling instead of being fatal.
 
+## 🚀 Upstream PR plan — decided 2026-07-29
+
+**Destination:** propose upstream to `Abhishek21k/claude-switch`. **Split into focused PRs**, not one branch of ten commits. **Code only** — this fork's working documents (`TASKS.md`, `ROADMAP.md`, `CHANGELOG.md`) stay here and are never part of a PR. **`cargo fmt` is not offered**; reformatting 44 hunks of untouched upstream code is unrelated to any fix and only obscures the diff.
+
+### Cherry-picking will not work — author against upstream instead
+
+`upstream/main` has diverged from this fork's internals. Any PR has to be written against upstream's signatures, using this branch as reference rather than as a source of patches:
+
+| | `upstream/main` | this fork |
+|---|---|---|
+| copy helper | `copy_dir_all(src, dst)` | `copy_dir_all_filtered(src, dst, skip_top_level)` |
+| add | `add_profile(name)` | `add_profile(name, include_history)` |
+| login | `login_profile(name) -> Result<()>` | `login_profile(name, include_history, email_hint) -> Result<LoginOutcome>` |
+
+`upstream/main` is also 5 months stale locally (`0df4cef`). **Re-fetch before starting** — everything below is measured against that snapshot.
+
+### PR order (each depends on the one above)
+
+1. **Symlink fix — standalone, send first.** Upstream's own `copy_dir_all` has the identical bug: `entry.file_type()?.is_dir()` does not follow links, so a symlink to a directory falls through to `fs::copy` and fails with `Is a directory`, aborting profile creation. **This is reproducible on upstream today and depends on no fork work** — smallest diff, clearest value, best first contact with the maintainer. Port the fix and the five symlink tests onto `copy_dir_all`.
+2. **Warm-state seeding** — `seed_profile_dir`, the skip lists, `--include-history`. Introduces the filtered copy, so it builds on PR 1.
+3. **Add/Login TUI fix** — `Mode::AddChoice`, `LoginOutcome`, same-account detection. Needs PR 2's `login_profile`.
+4. **Live-session guard** — needs `Mode::ConfirmRefresh` from PR 3, so it cannot go earlier.
+
+### Carried into every PR description
+
+- **3.8 as an explicit ask.** State that the work is Linux-only and name what needs a reviewer on another platform: macOS Keychain, Windows Credential Manager, and the Windows symlink fallback.
+- **The relevant `CHANGELOG.md` prose**, pasted into the PR body rather than committed — it already states the browser-session caveat and warm-state boundaries a reviewer would otherwise file as bugs.
+
+### Open question — README
+
+"Docs stay fork-only" is unambiguous for the trackers, but `README.md` is user-facing product documentation, not a working document. A PR that changes what `a` does without touching the README's keybinding table ships undocumented behavior, which maintainers usually reject. **Assumption, pending confirmation:** each PR carries only the README lines describing what *that* PR changes; nothing else.
+
 ## ▶ Next session — start here
 
 **Phase 3 is closed except 3.8, which is intentionally staying open for the upstream PR.** Nothing here blocks opening it.
 
-1. **Open the upstream PR** against `Abhishek21k/claude-switch` from `juansilvadesign/claude-switch@fix/warm-login`. The branch already tracks `upstream/main`, which is the right base for that comparison — the only consequence is that a bare `git push` aims at a repository this fork cannot write to, so keep naming `origin`.
-   - Carry 3.8 into the PR description as an explicit request: macOS Keychain, Windows Credential Manager, and the Windows symlink fallback all need a reviewer on that platform.
-   - `CHANGELOG.md` `[Unreleased]` is written to be readable as PR notes; it already states the browser-session caveat and the warm-state boundaries a reviewer would otherwise file as bugs.
-2. **Version and release**, once the PR direction is known. `Cargo.toml` is still `0.1.0` and the changelog is `[Unreleased]`. Whether this ships as a fork release or lands upstream changes what the version should say, so it is deliberately undecided.
+1. **`git fetch upstream`.** The local `upstream/main` is 5 months old; the PR plan above is measured against that snapshot and needs re-checking first.
+2. **Open PR 1 — the symlink fix** (see the PR plan). Branch off fresh `upstream/main`, port the fix onto upstream's `copy_dir_all`, bring the five symlink tests, and confirm the bug reproduces on unmodified upstream before writing the description.
+3. **Confirm the README question** in the PR plan before PR 3, which is the first one that changes user-visible TUI behavior.
+4. **Version and release** stays deliberately undecided — `Cargo.toml` is `0.1.0` and `CHANGELOG.md` is `[Unreleased]`. If the work lands upstream, upstream owns the version; the fork only needs its own if the PRs stall or are declined.
 
 **Resolved 2026-07-29 — the two mislabelled commits.** `6603736` and `bb803ed` claimed "cwd-aware profile switching and path mapping", a feature that does not exist here; they actually held the live-session guard and the symlink fix. Rewritten as four commits that say what they contain — guard, symlink fix, `cargo fmt`, docs — and force-pushed. The split was verified by diffing the reconstructed pre-`fmt` tree against the original commit: byte-identical, nothing lost. `backup-before-reword` still points at the old `bb803ed`; delete it once you are satisfied.
 
