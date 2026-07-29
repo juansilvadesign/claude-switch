@@ -42,12 +42,20 @@ enum Commands {
         /// Overwrite if profile already exists
         #[arg(short, long)]
         force: bool,
+        /// Also copy conversation history and session transcripts.
+        /// Off by default: separate sessions per profile are usually the point.
+        #[arg(long)]
+        include_history: bool,
     },
 
     /// Log in to a new Claude account and save it as a profile (skips detection prompt)
     Login {
         /// Profile name (alphanumeric, hyphens, underscores)
         name: String,
+        /// Also copy conversation history and session transcripts.
+        /// Off by default: separate sessions per profile are usually the point.
+        #[arg(long)]
+        include_history: bool,
     },
 
     /// Remove a saved profile
@@ -105,12 +113,12 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Add { name, force }) => {
-            handle_add(&manager, &name, force)?;
+        Some(Commands::Add { name, force, include_history }) => {
+            handle_add(&manager, &name, force, include_history)?;
         }
 
-        Some(Commands::Login { name }) => {
-            manager.login_profile(&name)?;
+        Some(Commands::Login { name, include_history }) => {
+            manager.login_profile(&name, include_history)?;
         }
 
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
@@ -158,7 +166,12 @@ fn main() -> Result<()> {
 
 /// Smart add: detects an active Claude session and asks the user whether to
 /// copy it or login fresh.
-fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
+fn handle_add(
+    manager: &ProfileManager,
+    name: &str,
+    force: bool,
+    include_history: bool,
+) -> Result<()> {
     match detect_current_account() {
         Some(acct) => {
             let email = acct.email.as_deref().unwrap_or("unknown");
@@ -172,9 +185,9 @@ fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
             match choice {
                 'c' => {
                     let result = if force {
-                        manager.add_profile_force(name)
+                        manager.add_profile_force(name, include_history)
                     } else {
-                        manager.add_profile(name)
+                        manager.add_profile(name, include_history)
                     };
                     match result {
                         Ok(p) => {
@@ -191,7 +204,7 @@ fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
                     }
                 }
                 'l' => {
-                    manager.login_profile(name)?;
+                    manager.login_profile(name, include_history)?;
                 }
                 _ => unreachable!(),
             }
@@ -199,7 +212,7 @@ fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
         None => {
             // No active session — go straight to login
             println!("No active Claude session found. Opening Claude for login…\n");
-            manager.login_profile(name)?;
+            manager.login_profile(name, include_history)?;
         }
     }
     Ok(())

@@ -66,56 +66,41 @@ impl ProfileManager {
     }
 
     /// Add a profile from an explicit source directory.
-    /// Used both by `add_profile` (which sources `~/.claude`) and by tests.
+    /// Seeding from a caller-supplied path; exercised by the tests.
+    #[allow(dead_code)]
     pub fn add_profile_from(&self, name: &str, src: &Path) -> Result<Profile> {
-        if !src.exists() {
-            bail!("Source directory '{}' does not exist.", src.display());
-        }
-        let dest = self.profiles_dir.join(name);
-        if dest.exists() {
-            bail!("Profile '{}' already exists. Use --force to overwrite.", name);
-        }
-        let profile = self.copy_and_build_profile(name, src)?;
-        self.upsert_profile(profile.clone())?;
-        Ok(profile)
+        self.copy_and_register(name, src, false, false)
     }
 
     /// Same as `add_profile_from` but overwrites an existing profile.
+    /// Kept as the sibling of `add_profile_from`; exercised by the tests.
+    #[allow(dead_code)]
     pub fn add_profile_from_force(&self, name: &str, src: &Path) -> Result<Profile> {
-        if !src.exists() {
-            bail!("Source directory '{}' does not exist.", src.display());
-        }
-        let dest = self.profiles_dir.join(name);
-        if dest.exists() {
-            fs::remove_dir_all(&dest)?;
-        }
-        let profile = self.copy_and_build_profile(name, src)?;
-        self.upsert_profile(profile.clone())?;
-        Ok(profile)
+        self.copy_and_register(name, src, false, true)
     }
 
     /// Add the current logged-in session as a named profile.
     /// Copies `~/.claude/` dir, `~/.claude.json` (home root), and on macOS
     /// extracts Keychain credentials into `.credentials.json`.
-    pub fn add_profile(&self, name: &str) -> Result<Profile> {
+    pub fn add_profile(&self, name: &str, include_history: bool) -> Result<Profile> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let src = home.join(".claude");
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        let mut profile = self.add_profile_from(name, &src)?;
+        let mut profile = self.copy_and_register(name, &src, include_history, false)?;
         self.copy_extra_credentials(&home, name, &mut profile)?;
         Ok(profile)
     }
 
     /// Same as `add_profile` but overwrites an existing profile.
-    pub fn add_profile_force(&self, name: &str) -> Result<Profile> {
+    pub fn add_profile_force(&self, name: &str, include_history: bool) -> Result<Profile> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let src = home.join(".claude");
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        let mut profile = self.add_profile_from_force(name, &src)?;
+        let mut profile = self.copy_and_register(name, &src, include_history, true)?;
         self.copy_extra_credentials(&home, name, &mut profile)?;
         Ok(profile)
     }
@@ -211,14 +196,14 @@ impl ProfileManager {
     /// skills/settings are missing — because `CLAUDE_CONFIG_DIR` relocates
     /// `.claude.json` too, not just credentials. So the warm parts of
     /// `~/.claude` are copied first (minus transcripts and prompt history, see
-    /// [`SEED_SKIP`]), and everything identifying the *old* account is then
+    /// [`SEED_SKIP_HISTORY`]), and everything identifying the *old* account is
     /// removed so Claude runs its normal login flow.
     ///
     /// Safety property: the credential file is always removed. Even if a future
     /// Claude version introduces an identity key this code does not know about,
     /// the profile still cannot authenticate as the old account — Claude has to
     /// re-authenticate and overwrites the stale metadata itself.
-    pub fn login_profile(&self, name: &str) -> Result<()> {
+    pub fn login_profile(&self, name: &str, include_history: bool) -> Result<()> {
         let profile_dir = self.profiles_dir.join(name);
         if profile_dir.exists() {
             let has_files = profile_dir.read_dir()?.next().is_some();
@@ -227,22 +212,36 @@ impl ProfileManager {
             }
         }
         fs::create_dir_all(&profile_dir)?;
-        let seeded = self.seed_profile_dir(&profile_dir)?;
+        let seeded = self.seed_profile_dir(&profile_dir, include_history)?;
 
         if seeded {
             println!("Seeded '{}' from your current setup (settings, skills, project trust).", name);
             println!("Conversation history and session transcripts were not copied.\n");
         }
-        println!("Launching Claude Code — please log in with the account for profile '{}'.", name);
-        println!("After logging in, exit Claude (Ctrl-C or /exit) to finish setup.\n");
+        println!("Opening your browser — sign in with the account for profile '{}'.\n", name);
 
+        // `claude auth login` is the purpose-built flow: it opens the browser,
+        // waits for the OAuth round-trip, and exits. Launching the full TUI
+        // instead would leave the user to remember `/exit`, and would trip
+        // Claude's nested-session guard when run from inside a Claude session.
         let status = std::process::Command::new("claude")
+            .args(["auth", "login"])
             .env("CLAUDE_CONFIG_DIR", &profile_dir)
             .status()
             .context("Failed to launch claude. Is it installed and in your PATH?")?;
 
-        // Claude has exited — check if it wrote any config files
-        let email = read_email_from_dir(&profile_dir);
+        if !status.success() {
+            bail!(
+                "Login did not complete for profile '{}'. Nothing was registered — \
+                 remove the directory and retry with: cswitch login {}",
+                name,
+                name
+            );
+        }
+
+        // Ask Claude who it ended up as, rather than re-parsing the config we
+        // just sanitized.
+        let email = read_account_email(&profile_dir).or_else(|| read_email_from_dir(&profile_dir));
         let profile = Profile {
             name: name.to_string(),
             email: email.clone(),
@@ -254,8 +253,7 @@ impl ProfileManager {
         let display_email = email.as_deref().unwrap_or("unknown");
         println!("\nProfile '{}' registered (account: {}).", name, display_email);
         println!("Launch with: cswitch use {}", name);
-
-        std::process::exit(status.code().unwrap_or(0));
+        Ok(())
     }
 
     /// Print shell alias/function lines for all managed profiles.
@@ -328,7 +326,7 @@ impl ProfileManager {
     /// Returns `false` without copying anything when there is no live
     /// `~/.claude` to seed from — a first-ever login is still a clean
     /// empty-directory login.
-    fn seed_profile_dir(&self, profile_dir: &Path) -> Result<bool> {
+    fn seed_profile_dir(&self, profile_dir: &Path, include_history: bool) -> Result<bool> {
         let Some(home) = dirs::home_dir() else {
             return Ok(false);
         };
@@ -337,7 +335,7 @@ impl ProfileManager {
             return Ok(false);
         }
 
-        copy_dir_all_filtered(&src, profile_dir, SEED_SKIP)?;
+        copy_dir_all_filtered(&src, profile_dir, &seed_skip(include_history))?;
 
         // Account metadata lives at the home root, not inside ~/.claude.
         let home_claude_json = home.join(".claude.json");
@@ -355,11 +353,34 @@ impl ProfileManager {
         Ok(true)
     }
 
-    fn copy_and_build_profile(&self, name: &str, src: &Path) -> Result<Profile> {
+    /// Copy a source config dir into a named profile and register it.
+    ///
+    /// `include_history` keeps conversation content (see [`SEED_SKIP_HISTORY`]);
+    /// `force` replaces an existing profile instead of erroring.
+    fn copy_and_register(
+        &self,
+        name: &str,
+        src: &Path,
+        include_history: bool,
+        force: bool,
+    ) -> Result<Profile> {
+        if !src.exists() {
+            bail!("Source directory '{}' does not exist.", src.display());
+        }
         let dest = self.profiles_dir.join(name);
-        copy_dir_all_filtered(src, &dest, SEED_SKIP)?;
+        if dest.exists() {
+            if force {
+                fs::remove_dir_all(&dest)?;
+            } else {
+                bail!("Profile '{}' already exists. Use --force to overwrite.", name);
+            }
+        }
+        copy_dir_all_filtered(src, &dest, &seed_skip(include_history))?;
         let email = read_email_from_dir(&dest);
-        Ok(Profile { name: name.to_string(), email, added: Utc::now(), last_used: None })
+        let profile =
+            Profile { name: name.to_string(), email, added: Utc::now(), last_used: None };
+        self.upsert_profile(profile.clone())?;
+        Ok(profile)
     }
 
     fn upsert_profile(&self, profile: Profile) -> Result<()> {
@@ -413,15 +434,24 @@ pub fn detect_current_account() -> Option<DetectedAccount> {
 /// inside `.claude.json` carries per-directory trust and MCP-server approvals
 /// and is deliberately preserved. Only the `projects/` **directory** — the
 /// transcripts — is skipped.
-const SEED_SKIP: &[&str] = &[
+/// Conversation content. Skipped by default; kept with `--include-history`.
+///
+/// Separating a profile's sessions is usually the *point* — but a user who
+/// relies on `claude --resume` across a switch can opt back in.
+const SEED_SKIP_HISTORY: &[&str] = &[
     "projects",      // session transcripts (NOT the .claude.json "projects" key)
     "history.jsonl", // every prompt ever typed
     "file-history",
+    "todos",
+];
+
+/// Machine-local caches and runtime state. Never copied, under any flag —
+/// stale here at best, confusing at worst.
+const SEED_SKIP_ALWAYS: &[&str] = &[
     "sessions",
     "session-env",
     "shell-snapshots",
     "paste-cache",
-    "todos",
     "tasks",
     "jobs",
     "daemon",
@@ -432,6 +462,15 @@ const SEED_SKIP: &[&str] = &[
     "ide",
     "statsig",
 ];
+
+/// Build the skip list for a seed operation.
+fn seed_skip(include_history: bool) -> Vec<&'static str> {
+    let mut skip = SEED_SKIP_ALWAYS.to_vec();
+    if !include_history {
+        skip.extend_from_slice(SEED_SKIP_HISTORY);
+    }
+    skip
+}
 
 /// Keys stripped from a seeded `.claude.json` when the profile is going to hold
 /// a *different* account.
@@ -456,7 +495,7 @@ const IDENTITY_KEYS: &[&str] = &[
 ///
 /// Pass an empty `skip_top_level` for a plain full copy.
 ///
-/// The filter is intentionally shallow: the names in [`SEED_SKIP`] are all
+/// The filter is intentionally shallow: the skipped names are all
 /// top-level entries of a Claude config dir, and matching at every depth would
 /// silently drop a user's own directory that happened to share a name (a
 /// project literally called `cache/`, for instance).
@@ -570,6 +609,29 @@ fn extract_windows_credentials() -> Option<String> {
     // Validate it's JSON
     serde_json::from_str::<serde_json::Value>(&creds).ok()?;
     Some(creds)
+}
+
+/// Ask Claude which account a profile is actually authenticated as.
+///
+/// Authoritative where the config files are not: it reflects the live
+/// credential, not whatever metadata happens to be on disk. Returns `None` if
+/// the profile is logged out or the CLI is too old to have `auth status`.
+fn read_account_email(profile_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .args(["auth", "status", "--json"])
+        .env("CLAUDE_CONFIG_DIR", profile_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    if val.get("loggedIn").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    val.get("email")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Read email from `~/.claude.json` at home root (macOS stores account metadata here).
@@ -1028,7 +1090,7 @@ mod tests {
         mgr.add_profile_from("taken", &src).unwrap();
 
         // login_profile should refuse because the dir is non-empty
-        let err = mgr.login_profile("taken").unwrap_err();
+        let err = mgr.login_profile("taken", false).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
@@ -1085,7 +1147,7 @@ mod tests {
         fs::write(src.join("skills/a.md"), "keep me").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all_filtered(&src, &dst, SEED_SKIP).unwrap();
+        copy_dir_all_filtered(&src, &dst, &seed_skip(false)).unwrap();
 
         assert!(!dst.join("projects").exists(), "transcripts must not be copied");
         assert!(!dst.join("history.jsonl").exists(), "prompt history must not be copied");
@@ -1103,7 +1165,7 @@ mod tests {
         fs::write(src.join("skills/cache/keep.txt"), "nested").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_all_filtered(&src, &dst, SEED_SKIP).unwrap();
+        copy_dir_all_filtered(&src, &dst, &seed_skip(false)).unwrap();
 
         assert!(dst.join("skills/cache/keep.txt").exists());
     }
@@ -1159,6 +1221,27 @@ mod tests {
         fs::write(&bad, "not json at all").unwrap();
         sanitize_claude_json(&bad).unwrap();
         assert_eq!(fs::read_to_string(&bad).unwrap(), "not json at all");
+    }
+
+    #[test]
+    fn include_history_keeps_conversations_but_never_machine_state() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("projects")).unwrap();
+        fs::create_dir_all(src.join("shell-snapshots")).unwrap();
+        fs::write(src.join("projects/t.jsonl"), "conversation").unwrap();
+        fs::write(src.join("history.jsonl"), "prompts").unwrap();
+        fs::write(src.join("shell-snapshots/s.sh"), "machine-local").unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_dir_all_filtered(&src, &dst, &seed_skip(true)).unwrap();
+
+        assert!(dst.join("projects/t.jsonl").exists(), "opt-in keeps transcripts");
+        assert!(dst.join("history.jsonl").exists(), "opt-in keeps prompt history");
+        assert!(
+            !dst.join("shell-snapshots").exists(),
+            "machine-local state is skipped under every flag"
+        );
     }
 
     #[test]
