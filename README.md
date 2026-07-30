@@ -211,6 +211,19 @@ cswitch use personal
 
 Both run independently with their own credentials and config.
 
+### One thing to watch
+
+The profile list is shared, but a running session is not: `r` (refresh) and `d` (delete) act on files another terminal may have open right now. Refreshing a profile mid-session replaces its credentials underneath a live login; deleting one removes the config directory that session is reading from.
+
+`cswitch` checks for this. When a profile was written to recently, the confirmation turns red and says so:
+
+```
+  In use? Written 4 min ago by a Claude session.
+  Another terminal may have this profile open right now.
+```
+
+It is a warning, not a block — `cswitch` can see that a session wrote to the profile, not whether that terminal is still open. If you know it is closed, go ahead.
+
 ## License
 
 MIT
