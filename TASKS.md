@@ -213,6 +213,27 @@ The workspace's 93 skill symlinks live at `ai-synthesizer/.claude/skills/`. They
 
 `upstream/main` is also 5 months stale locally (`0df4cef`). **Re-fetch before starting** — everything below is measured against that snapshot.
 
+### ✅ Opened 2026-07-29
+
+| PR | Size | Scope |
+|---|---|---|
+| [#1](https://github.com/Abhishek21k/claude-switch/pull/1) | +165/-1 | Symlink fix — standalone |
+| [#2](https://github.com/Abhishek21k/claude-switch/pull/2) | +754/-76 | Warm-state seeding + verified login |
+| [#3](https://github.com/Abhishek21k/claude-switch/pull/3) | +1484/-108 | Add/Login TUI + refresh confirmation |
+| [#4](https://github.com/Abhishek21k/claude-switch/pull/4) | +1822/-123 | Live-session guard |
+
+Stacked: each is based on the previous branch, so its diff includes the earlier ones until they merge — stated at the top of each description. Branches are `upstream-pr/*` on `origin`. Test counts climb 29 → 34 → 42 → 60 → 72, and every PR holds clippy at upstream's existing 8 warnings. `cargo fmt` was **not** offered, per the decision above. No fork working documents were included; `README.md` changes ship with the PR that changes the behaviour they describe (confirmed 2026-07-29).
+
+### 🔎 Prior art — `m2selfA/claude-switch`
+
+A second fork, 44 commits ahead of upstream (v0.8.4: MCP manager, SFTP/remote operations, gateway modes). **It hit the symlink bug independently and patched `copy_dir_all` for it**, reaching the same two core decisions: recreate the link rather than dereference it, and fall back to copying when Windows refuses. Its Windows implementation is structurally identical to PR #1's.
+
+One difference favours PR #1: that fork passes the raw `read_link` target straight to `symlink()`. Correct for an absolute target, but a **relative** one is recreated literally at a different directory depth and resolves to nothing — silently. PR #1 resolves relative targets to absolute and tests it.
+
+One difference favours theirs: they warn and continue per entry instead of propagating, so a single unreadable file cannot abandon the whole copy. Worth adopting if a maintainer asks.
+
+**On 3.8:** they have Windows-specific commits, so they clearly build there — but nothing indicates they *tested* the symlink path specifically. Not a substitute for the cross-platform verification the PRs ask for.
+
 ### PR order (each depends on the one above)
 
 1. **Symlink fix — standalone, send first.** Upstream's own `copy_dir_all` has the identical bug: `entry.file_type()?.is_dir()` does not follow links, so a symlink to a directory falls through to `fs::copy` and fails with `Is a directory`, aborting profile creation. **This is reproducible on upstream today and depends on no fork work** — smallest diff, clearest value, best first contact with the maintainer. Port the fix and the five symlink tests onto `copy_dir_all`.
