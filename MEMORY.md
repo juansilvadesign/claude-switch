@@ -15,3 +15,9 @@ type: project
 - **Next:**
   1. **Browser login**
   2. **Bundle C**
+
+## 📚 Detailed history
+
+⚠️ **This repository is PUBLIC, so the full internal history is deliberately NOT kept here.** This file carries the sanitized technical state only.
+
+The complete record lives in the private `ai-synthesizer` workspace at `knowledge/projects/_memory/project_claude_switch_fork.md` — session-by-session, including the parts that must not be published (hosting account details, client agreements, internal IDs). Folded there 2026-08-17.
