@@ -825,7 +825,8 @@ fn symlink_to(target: &Path, dest: &Path) -> std::io::Result<()> {
     match made {
         Ok(()) => Ok(()),
         Err(_) if target.is_dir() => {
-            copy_dir_all(target, dest).map_err(|e| std::io::Error::other(e.to_string()))
+            copy_dir_all_filtered(target, dest, &[])
+                .map_err(|e| std::io::Error::other(e.to_string()))
         }
         Err(_) => fs::copy(target, dest).map(|_| ()),
     }
