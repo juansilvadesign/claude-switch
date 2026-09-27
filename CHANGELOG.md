@@ -16,6 +16,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
+- **`cswitch sync`** links shared skills into one or all profiles, with dry-run previews and explicit adoption of diverged copies after a backup.
 - **New profiles are seeded with your warm setup before authenticating.** Settings, skills, and per-project trust are copied first, then every trace of the previous account is removed so Claude runs its normal login. An empty profile directory is a blank Claude Code: `CLAUDE_CONFIG_DIR` relocates `.claude.json` too, so MCP servers drop back to pending approval and per-directory trust disappears.
 - **Same-account detection.** Authenticating as an account another profile already holds is reported by name, instead of looking like a distinct account was added. It is a note, not an error — two profiles can intentionally isolate settings for one account.
 - **A confirmation before `r` overwrites a profile**, naming the account it currently holds and the account it will become, and turning red when those differ.
@@ -24,6 +25,10 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Changed
 
+- **Shell aliases run `cswitch use`.** They sync skills before launch and pass Claude flags through.
+- **Unix launches use `exec`.** Claude takes over the process, preserving its PID, signals, and exit code.
+- **New profiles link user-level skills individually instead of copying them.** Their account-managed `skills/synced/` directory remains separate.
+- **Registry writes are atomic.** A complete temporary file is renamed over `registry.json`.
 - **Login runs `claude auth login`, and the resulting account is read back from `claude auth status --json`.** Account identity is never taken from user input or from stale config metadata.
 - **Conversation history is no longer copied by default.** Transcripts, prompt history, and machine-local caches are excluded unless `--include-history` is passed; separate sessions per profile are usually the point.
 - **A clean exit from the login flow is no longer treated as success.** The session is re-checked afterwards, so a dismissed browser tab cannot register a profile with no credentials behind it.
@@ -33,5 +38,5 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 - **`cswitch` cannot choose which account a browser authorizes.** `claude auth login` delegates that to your claude.ai session, so a signed-in browser authorizes that account with no picker. `--email` pre-fills the login page; it does not override the session. Sign out or use a private window to authenticate as someone else. The tool now reports when this happens rather than hiding it.
 - **Account email is read-only.** There is deliberately no field for typing one in: that would relabel copied credentials without changing which account they authenticate as.
-- **Project-level skills do not follow a profile.** Skills in `~/.claude/skills/` are copied; skills in a repository's own `.claude/skills/` belong to that repository and load from wherever you launch Claude, identically under every profile.
+- **Project-level skills do not follow a profile.** Skills in `~/.claude/skills/` are linked individually; skills in a repository's own `.claude/skills/` belong to that repository and load from wherever you launch Claude, identically under every profile.
 - **MCP authorizations do not transfer.** Server definitions are copied, but an OAuth grant belongs to the account that gave it, so a server may ask a new account to authenticate again.
