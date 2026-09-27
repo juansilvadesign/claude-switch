@@ -11,7 +11,8 @@ type: project
 
 ## ▶ Live resume state
 
-- ✅ **Bundles A and B pushed.**
+- ✅ **Bundle A shipped.** Per-directory switching (Bundle B) was never built. It was parked on 2026-09-27 because both profiles are run from the same directory.
+- **If Bundle B is revived:** use a launch-time `claude` shell wrapper, a global `~/.claude-switch/routes.json` with longest-prefix matching, and let unrouted folders fall through to plain `claude`.
 - **Next:**
   1. **Browser login**
   2. **Bundle C**

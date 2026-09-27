@@ -1,10 +1,16 @@
 # claude-switch Fork — Build Task Tracker
 
+## Skills sync — 2026-09-27
+
+- [x] Link eligible user-level skills per entry, preserve each profile's `skills/synced/`, and back up identical or explicitly adopted copies.
+- [x] Sync on launch; route generated aliases through `cswitch use`; pass Claude flags through.
+- [x] Verify the engine with hermetic tests for divergence, backups, dangling links, dry runs, idempotence, symlinked source skills, and seeding. Verify the built binary in a temporary home.
+
 > **Open this first, every session.** Active implementation work lives here. Check a box when it is complete and leave a short note when it is only partial. Deferred/v2+ ideas live in [`ROADMAP.md`](ROADMAP.md); user-facing behavior and installation live in [`README.md`](README.md).
 
 **Current objective:** make the TUI's account-creation flow unambiguous and prevent a user who wants a different Claude account from accidentally cloning the default account's credentials.
 
-**Plan status:** Phase 1 implemented and verified 2026-07-29 (78 tests, clippy clean). **The real second-account login landed 2026-07-29** — `business` now holds `admin@zoku.com.br`, a genuinely different account from `personal`. Phase 1 is closed.
+**Plan status:** Phase 1 implemented and verified 2026-07-29 (78 tests, clippy clean). **The real second-account login landed 2026-07-29** — `business` now holds a genuinely different account from `personal`. Phase 1 is closed.
 
 **Keep these concepts separate:**
 
@@ -48,8 +54,8 @@ The login the fix was built for finally ran. Every symptom in the root-cause sec
 |---|---|---|---|
 | `.credentials.json` sha256 | `f5d03d01…` | `f5d03d01…` | **`91ca9db6…`** |
 | size | 1004 B | 1004 B | **930 B** |
-| `claude auth status` email | — | jaypy.uxdesign@gmail.com | **admin@zoku.com.br** |
-| orgId | — | `da41499e…` | **`ebfe92b1…`** |
+| `claude auth status` email | — | personal account | **business account** |
+| orgId | — | personal org | **business org (differs)** |
 
 The byte-identical credential file that defined the original bug is broken apart, the registry email matches live auth for both profiles, and the two accounts sit in separate orgs. `~/.claude` is still `f5d03d01…` — untouched, as the isolation guarantee requires.
 
