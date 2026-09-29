@@ -1,5 +1,11 @@
 # claude-switch Fork — Build Task Tracker
 
+## Plan-limit bars — 2026-09-29
+
+- [x] Read Claude Code's cached plan-limit snapshot per profile without network access or profile writes.
+- [x] Show the 5-hour and 7-day windows, snapshot age, reset state, and severity in the CLI and TUI.
+- [x] Cover parsing, fallback fields, account matching, read-only access, seeding, and display with synthetic fixtures.
+
 ## Skills sync — 2026-09-27
 
 - [x] Link eligible user-level skills per entry, preserve each profile's `skills/synced/`, and back up identical or explicitly adopted copies.

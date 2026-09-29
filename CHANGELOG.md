@@ -18,6 +18,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
+- **Plan-limit snapshots** in `cswitch list`, `cswitch info`, and the TUI details panel, with cache age, reset markers, and Claude Code's severity flags.
 - **`cswitch sync`** links shared skills into one or all profiles, with dry-run previews and explicit adoption of diverged copies after a backup.
 - **New profiles are seeded with your warm setup before authenticating.** Settings, skills, and per-project trust are copied first, then every trace of the previous account is removed so Claude runs its normal login. An empty profile directory is a blank Claude Code: `CLAUDE_CONFIG_DIR` relocates `.claude.json` too, so MCP servers drop back to pending approval and per-directory trust disappears.
 - **Same-account detection.** Authenticating as an account another profile already holds is reported by name, instead of looking like a distinct account was added. It is a note, not an error — two profiles can intentionally isolate settings for one account.
