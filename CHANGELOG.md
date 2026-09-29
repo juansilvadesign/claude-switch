@@ -13,6 +13,8 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 - **Adding an account in the TUI no longer silently clones the account you already had.** Pressing `a` used to copy `~/.claude` wholesale — credentials included — so every "new account" came back with the default account's email, by construction. `a` now asks for a name and then which operation you meant: copy the current session, or log in to a different account. The CLI and the first-run screen already offered this choice; the normal TUI did not.
 - **A profile name that was already taken no longer tears down the TUI.** The error surfaces as an in-app message instead of propagating out of the event loop.
 - **Symlinked content in `~/.claude` no longer aborts profile creation.** A symlink to a directory reported as neither file nor directory and reached a plain file copy, which failed with `Is a directory` and abandoned the whole operation. Links are now recreated as links, with relative targets resolved to absolute so they still resolve from the profile's new location. A dangling link stays dangling rather than being fatal.
+- **Seeding without history no longer copies `transcripts/` or `plans/`.** Both hold conversation content (verbatim prompts, tool calls and plan-mode documents), and a profile seeded for another account must not inherit either. `--include-history` still brings them along. `debug/`, `usage-data/` and `stats-cache.json` are never copied, because they are the source account's usage accounting. Ported from upstream `2308675`.
+- **The refresh confirmation now says when it will delete the profile's conversation history.** `r` reseeds without history, so transcripts and prompt history are lost even on a same-account refresh, which the dialog used to present as safe. It now names the loss and turns red. Ported from upstream `1ba8402`.
 
 ### Added
 
@@ -33,6 +35,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 - **Conversation history is no longer copied by default.** Transcripts, prompt history, and machine-local caches are excluded unless `--include-history` is passed; separate sessions per profile are usually the point.
 - **A clean exit from the login flow is no longer treated as success.** The session is re-checked afterwards, so a dismissed browser tab cannot register a profile with no credentials behind it.
 - **A failed or cancelled login removes only a directory that attempt created**, and leaves the registry untouched either way.
+- **Synced with upstream v0.2.0.** The version is now 0.2.0. The rest of upstream's changes are this fork's own pull requests #1–#4, so upstream's `main` is recorded as merged without changing any file.
 
 ### Notes
 
