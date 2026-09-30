@@ -18,6 +18,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
+- **Offline token ledger** in `cswitch usage`, with incremental transcript ingest, cross-file and sidechain deduplication, project labels and attribution explanations, editable API-equivalent rates, and cost-state verification. Profile removal retains its ledger rows unless `--purge-usage` is specified.
 - **Plan-limit snapshots** in `cswitch list`, `cswitch info`, and the TUI details panel, with cache age, reset markers, and Claude Code's severity flags.
 - **`cswitch sync`** links shared skills into one or all profiles, with dry-run previews and explicit adoption of diverged copies after a backup.
 - **New profiles are seeded with your warm setup before authenticating.** Settings, skills, and per-project trust are copied first, then every trace of the previous account is removed so Claude runs its normal login. An empty profile directory is a blank Claude Code: `CLAUDE_CONFIG_DIR` relocates `.claude.json` too, so MCP servers drop back to pending approval and per-directory trust disappears.

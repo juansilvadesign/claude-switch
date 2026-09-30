@@ -1,5 +1,12 @@
 # claude-switch Fork — Build Task Tracker
 
+## Token usage ledger — 2026-09-29
+
+- [x] Ingest complete transcript lines into an offline ledger with cursors, a lock, and cross-file and sidechain deduplication.
+- [x] Report token totals and API-equivalent cost by profile, workspace, project, session, model, or day; keep an attributed summary for later surfaces.
+- [x] Support labels, attribution explanations, an unattributed queue, editable rates, and cost-state verification on synthetic fixtures.
+- [x] Keep transcript content out of the ledger and retain rows when a profile or transcript is removed unless usage purge is requested.
+
 ## Plan-limit bars — 2026-09-29
 
 - [x] Read Claude Code's cached plan-limit snapshot per profile without network access or profile writes.
