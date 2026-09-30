@@ -1,5 +1,13 @@
 # claude-switch Fork — Build Task Tracker
 
+## Claude Console login and API keys — 2026-09-30
+
+- [x] Create Console profiles from the CLI and Add menu, and verify the managed Console key without requiring an email.
+- [x] Store per-profile API keys in private files outside profiles; manage only the profile's `apiKeyHelper` in settings with backups and a race check.
+- [x] Show the offline auth mode in list, info, and TUI; mask key entry and confirm key clearing and refresh loss.
+- [x] Strip inherited API identity and helpers when seeding or copying, and remove saved keys on profile removal or refresh.
+- [x] Cover the flow with synthetic, hermetic tests and the four build gates.
+
 ## Token usage ledger — 2026-09-29
 
 - [x] Ingest complete transcript lines into an offline ledger with cursors, a lock, and cross-file and sidechain deduplication.
