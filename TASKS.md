@@ -1,5 +1,12 @@
 # claude-switch Fork — Build Task Tracker
 
+## Codex profiles — 2026-10-01
+
+- [x] Add a compatible tool field and isolate unknown registry values.
+- [x] Seed Codex homes by allowlist, log in through Codex, verify exit status without exposing output, and parse offline identity claims.
+- [x] Dispatch use and aliases by tool; show tool and optional plan type in CLI and TUI views.
+- [x] Keep API keys, gateways, skills sync, usage, limits and refresh Claude-only; cover synthetic fixtures and hermetic gates.
+
 ## Claude API key gateway settings — 2026-10-01
 
 - [x] Accept a hidden base URL or provider settings JSON after interactive key entry; keep piped key rotation unchanged.
