@@ -18,6 +18,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
+- **Anthropic-compatible gateway settings for API keys.** After hidden key entry, the CLI and TUI accept a base URL or provider settings JSON. Credential fields in pasted JSON are discarded; non-credential settings can be saved per normalized URL and managed with `cswitch gateway list` and `cswitch gateway forget`. Clearing a managed key removes its base URL in the same settings edit, and seeded or copied profiles drop inherited gateway settings.
 - **Anthropic Console login and per-profile API keys.** Console profiles can be created from the CLI or Add menu. `cswitch key set` stores a private key outside the profile and installs a helper in `settings.json`; `key clear` removes it and reports the fallback. CLI and TUI views show the authentication source, with `api` in the list for API-billed profiles.
 - **Offline token ledger** in `cswitch usage`, with incremental transcript ingest, cross-file and sidechain deduplication, project labels and attribution explanations, editable API-equivalent rates, and cost-state verification. Profile removal retains its ledger rows unless `--purge-usage` is specified.
 - **Plan-limit snapshots** in `cswitch list`, `cswitch info`, and the TUI details panel, with cache age, reset markers, and Claude Code's severity flags.

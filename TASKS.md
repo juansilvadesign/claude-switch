@@ -1,5 +1,13 @@
 # claude-switch Fork — Build Task Tracker
 
+## Claude API key gateway settings — 2026-10-01
+
+- [x] Accept a hidden base URL or provider settings JSON after interactive key entry; keep piped key rotation unchanged.
+- [x] Drop credential fields, normalize safe base URLs, and save private defaults per URL with list and forget commands.
+- [x] Change helper and gateway in one settings edit; track owned env names in a private manifest and remove the base URL on key clear.
+- [x] Strip inherited gateway settings on seeding and Copy, and delete manifests before remove and refresh.
+- [x] Show gateway host and ownership in info and TUI without printing unrecognized raw URLs or pasted values.
+
 ## Claude Console login and API keys — 2026-09-30
 
 - [x] Create Console profiles from the CLI and Add menu, and verify the managed Console key without requiring an email.
