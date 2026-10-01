@@ -35,6 +35,13 @@ A [second fork](https://github.com/m2selfA/claude-switch) is 44 commits ahead of
 
 **Deliberately not taken:** MCP manager, plugin management, provider keys, Paseo, TinyFish, shims and shim recovery, local gateway/runtime modes, SFTP and remote-alias sync. That is a different product. The "Out of scope" section below already excludes administering the remote account; provider-key and gateway management is the same category.
 
+**Revised 2026-09-30, amended 2026-10-01.** The owner took three narrow pieces of that list:
+- a per-profile **API key**, through `apiKeyHelper`, optionally pointed at an Anthropic-compatible gateway. The gateway's base URL, model names and flags are set with the key, saved as defaults per base URL, and removed with the key;
+- **Codex** profiles, one `CODEX_HOME` each;
+- **Antigravity** profiles, one isolated HOME each.
+
+Each keeps this fork's premise that one profile is one isolated config environment. Everything else above stays out: running or managing gateways and proxies, MCP/plugin managers, and remote sync.
+
 **One observation independent of features:** their test suite is roughly 10,200 lines (`profile/tests.rs` 6,775 + `tui/tests.rs` 3,433) against this fork's 72 tests. Much larger surface, but it is a fair indication of where their confidence comes from.
 
 ## Out of scope

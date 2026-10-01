@@ -23,7 +23,21 @@ type: project
 - **Lessons (they cost two fix rounds):**
   - Claude Code writes one record per content block. The copies of a response share one id while `output_tokens` grows, so keep the largest copy and union the tool calls across copies, counted by `tool_use` id.
   - Title and cost-state records carry no `timestamp`.
-- **Next:** Phase 3, a TUI usage panel that reads `summary.json`. Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
+- ✅ **Claude API keys and gateway settings (Stage A of the accounts work) shipped 2026-10-01.**
+  - `cswitch login <name> --console` creates an Anthropic Console (API billing) profile.
+  - `cswitch key set` and `cswitch key clear` switch a profile to the owner's own key and back, through a cswitch-managed `apiKeyHelper`. The key lives outside the profile in `~/.claude-switch/keys/` (`0600`), so seeding can never copy it.
+  - **A key can come with an Anthropic-compatible gateway.**
+    - After the key, a hidden step takes a base URL or the provider's settings JSON. Any token in the JSON is ignored.
+    - The non-credential settings can be saved as defaults per base URL, with `cswitch gateway list` and `forget`.
+    - `key clear` removes them in the same write as the helper, so a saved login never reaches the gateway.
+  - Seeding now also strips `primaryApiKey` and `customApiKeyResponses`. A copied profile drops an inherited base URL.
+- **Lessons (three fix rounds):**
+  - A refusal test must make the refusal the *only* reason to fail.
+    - A symlink that pointed at an invalid file hid the missing symlink check.
+    - A fixture manifest that listed the base URL hid the unconditional base-URL strip.
+  - The TUI's `k` is vim-style "up". The key actions live on `p`/`P`.
+  - A hidden multi-line input needs a way out of malformed input: a blank line ends a JSON paste.
+- **Next:** Stage B, Codex profiles (one `CODEX_HOME` each), then Stage C, Antigravity profiles (one fake HOME each). The TUI usage panel (Phase 3) follows. Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
 
 ## 📚 Detailed history
 
