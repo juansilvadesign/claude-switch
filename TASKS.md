@@ -23,6 +23,12 @@
 - [x] Strip inherited API identity and helpers when seeding or copying, and remove saved keys on profile removal or refresh.
 - [x] Cover the flow with synthetic, hermetic tests and the four build gates.
 
+## Usage billing and plan capacity — 2026-10-02
+
+- [x] Add exact list-price aliases, private owner billing settings, prefix-scoped rates, top-ups and plan fees.
+- [x] Persist deduplicated hourly usage and weekly limit history; estimate plan capacity from snapshot utilization.
+- [x] Show offline 30-day value in `list` and usage details in `info`.
+
 ## Token usage ledger — 2026-09-29
 
 - [x] Ingest complete transcript lines into an offline ledger with cursors, a lock, and cross-file and sidechain deduplication.
