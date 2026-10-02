@@ -37,7 +37,25 @@ type: project
     - A fixture manifest that listed the base URL hid the unconditional base-URL strip.
   - The TUI's `k` is vim-style "up". The key actions live on `p`/`P`.
   - A hidden multi-line input needs a way out of malformed input: a blank line ends a JSON paste.
-- **Next:** Stage B, Codex profiles (one `CODEX_HOME` each), then Stage C, Antigravity profiles (one fake HOME each). The TUI usage panel (Phase 3) follows. Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
+- ✅ **Codex profiles (Stage B of the accounts work) shipped 2026-10-02.**
+  - `cswitch login <name> --tool codex` creates a profile with its own `CODEX_HOME`. It is seeded from `CODEX_HOME` or `~/.codex` with five warm entries only: `config.toml`, `AGENTS.md`, `agents/`, `rules/` and `skills/`. Credentials, sessions, the sqlite state and `packages/` are never copied.
+  - The login runs `codex login`, then `codex login status`, and trusts only their exit codes. The email and plan are read offline from the `id_token` claims in `auth.json`.
+    - A failed login or status check registers nothing, and the refusal names the step that failed.
+    - A login whose claims can't be read is still registered, without an email.
+  - `use`, the aliases (`codex-<name>`), `list`, `info` and the TUI dispatch by tool. Keys, gateways, skills sync, usage, plan limits and refresh stay Claude-only.
+  - The registry gains a `tool` field. A missing field loads as Claude. An unknown value is kept verbatim on save, and that profile refuses every action.
+- **Release notes:**
+  - ⛔ **Remove the Codex profiles before you downgrade.** A build without Codex support treats a Codex profile as Claude: `use` launches `claude` in the Codex home, `sync --all` links Claude skills into it, `usage` ingests it, and the next registry save drops `tool`. Remove the Codex profiles or restore `registry.json` first.
+  - Codex 0.158 creates `packages/` and `app-server-daemon/` itself in a fresh `CODEX_HOME`, so leaving them out of the seed doesn't break the first launch.
+  - `~/.codex/log/` is empty on Codex 0.158, whose logs moved to sqlite. The live-session warning reads `sessions/` and `shell_snapshots/`.
+  - A `skills/` directory made mostly of links keeps its nested links when seeded.
+- **Lessons (two fix rounds):**
+  - A hotkey on a screen with a text field takes that character away from the field. The first-run screen bound `a`, so a name containing `a` jumped to another flow.
+  - A display rule can break output that isn't a display. "Every line ≤ 120 columns" made long-named profiles lose their shell alias.
+  - An enum that folds unknown values into one variant rewrites them on the next save. Keep the raw string.
+  - A refusal must name the step that failed. One message for both a failed login and a failed status check was false whenever `auth.json` existed.
+  - Code that spawns an external CLI needs a fake of that CLI on `PATH`. Unit tests alone never reach its wiring.
+- **Next:** Stage C, Antigravity profiles (one fake HOME each). The TUI usage panel (Phase 3) follows. Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
 
 ## 📚 Detailed history
 
