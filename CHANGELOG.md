@@ -18,7 +18,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
-- **Offline usage billing estimates.** `list` shows a `30D $` column, and `info` shows today, seven-day and 30-day tokens and dollars. Per-token profiles can use owner-set rates and top-ups; subscription profiles can show an owner-set fee and estimated weekly capacity. Exact model aliases map gateway transcript names to editable list prices. Settings stay in a private file and no billing service is contacted.
+- **Offline usage billing estimates.** `list` shows a `30D $` column, and `info` shows today, seven-day and 30-day tokens and dollars. Per-token profiles can use owner-set rates; subscription profiles can show an owner-set fee and estimated weekly capacity. Exact model aliases map gateway transcript names to editable list prices. Settings stay in a private file and no billing service is contacted.
 
 - **Codex profiles.** Log in with a separate `CODEX_HOME` per profile, seeded only with warm configuration. `use`, aliases, list, info and the TUI dispatch by tool; Codex identity and plan type come from local JWT claims. Claude-only key, gateway, sync, usage and limit paths exclude Codex profiles.
 - **Anthropic-compatible gateway settings for API keys.** After hidden key entry, the CLI and TUI accept a base URL or provider settings JSON. Credential fields in pasted JSON are discarded; non-credential settings can be saved per normalized URL and managed with `cswitch gateway list` and `cswitch gateway forget`. Clearing a managed key removes its base URL in the same settings edit, and seeded or copied profiles drop inherited gateway settings.

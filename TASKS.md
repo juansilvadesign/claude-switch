@@ -25,7 +25,7 @@
 
 ## Usage billing and plan capacity — 2026-10-02
 
-- [x] Add exact list-price aliases, private owner billing settings, prefix-scoped rates, top-ups and plan fees.
+- [x] Add exact list-price aliases, private owner billing settings, prefix-scoped rates and plan fees.
 - [x] Persist deduplicated hourly usage and weekly limit history; estimate plan capacity from snapshot utilization.
 - [x] Show offline 30-day value in `list` and usage details in `info`.
 
