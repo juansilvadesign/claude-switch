@@ -28,6 +28,7 @@
 - [x] Add exact list-price aliases, private owner billing settings, prefix-scoped rates and plan fees.
 - [x] Persist deduplicated hourly usage and weekly limit history; estimate plan capacity from snapshot utilization.
 - [x] Show offline 30-day value in `list` and usage details in `info`.
+- [x] Track recorded and detected free weekly resets as capacity segments; show effective USD per million tokens.
 
 ## Token usage ledger — 2026-09-29
 
