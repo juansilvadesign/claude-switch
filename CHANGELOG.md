@@ -34,6 +34,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Changed
 
+- **Missing profile emails show `—` in `info` and the TUI.** Claude and Codex profiles previously showed `unknown` there.
 - **Shell aliases run `cswitch use`.** They sync skills before launch and pass Claude flags through.
 - **Unix launches use `exec`.** Claude takes over the process, preserving its PID, signals, and exit code.
 - **New profiles link user-level skills individually instead of copying them.** Their account-managed `skills/synced/` directory remains separate.
