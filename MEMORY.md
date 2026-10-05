@@ -55,7 +55,27 @@ type: project
   - An enum that folds unknown values into one variant rewrites them on the next save. Keep the raw string.
   - A refusal must name the step that failed. One message for both a failed login and a failed status check was false whenever `auth.json` existed.
   - Code that spawns an external CLI needs a fake of that CLI on `PATH`. Unit tests alone never reach its wiring.
-- **Next:** Stage C, Antigravity profiles (one fake HOME each). The TUI usage panel (Phase 3) follows. Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
+- ✅ **Offline spend and plan capacity (Stage 3 of the usage work) shipped 2026-10-05.**
+  - `cswitch list` and the TUI list show a `30D $` value per profile: the spend of a per-token profile, or `~` plus the list-price value of a plan's usage.
+  - `cswitch info` and the TUI detail panel show tokens and dollars for today, 7 days and 30 days, the plan fee or the rate, an effective USD per million tokens, and an estimate of how much list-price usage fits in the weekly limit.
+  - **Settings** are the owner's own, in a private `usage/billing.json` (`0600`):
+    - `usage plan` sets a monthly fee, and `usage rate` a flat or per-type price, scoped by model prefix;
+    - `usage reset` records a free weekly limit reset, by day or by minute;
+    - `usage alias` maps a gateway's model names to list prices in `rates.json`.
+
+    Nothing is fetched from any billing service.
+  - **Data:** each ingest writes an hourly rollup (`hourly.json`) and appends Claude Code's weekly limit snapshot to `limits.jsonl`. `list` and `info` only read. The TUI ingests in a background thread, and drawing never waits for it.
+  - **Capacity:** a weekly window is split at each reset, whether recorded or detected as a drop of at least one point. A segment's estimate is its list-price usage divided by the highest utilization seen in it, from 20% up. A reset known only by its day gives a range.
+- **Lessons (four fix rounds):**
+  - A weekly limit can be reset for free in the middle of a window, without moving its reset time. Reading that week as one window doubles the estimate.
+  - "Every line ≤ 120 columns" needs the widest real value in the fixture. A fresh snapshot's age was one character wider than its column.
+  - A release hash belongs to one commit. A test-only commit still changes the binary; a docs-only one doesn't.
+  - A cleanup can make an old test pass for the wrong reason. It happened twice:
+    - once empty settings entries were pruned, the purge test's empty fixture entry vanished without the purge;
+    - once an empty window gave no estimate, a test with no usage in its fixture passed whatever the code did.
+  - A test must fail on its known-bad, not hang. One blocked on a channel that the same thread was to release.
+  - What sits in `main`'s dispatch or in the TUI's event loop is out of a unit test's reach. Extract the decision into a function, or drive the built binary.
+- **Next:** Stage C, Antigravity profiles (one fake HOME each). Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
 
 ## 📚 Detailed history
 
