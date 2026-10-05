@@ -1,5 +1,13 @@
 # claude-switch Fork — Build Task Tracker
 
+## Antigravity profiles — 2026-10-05
+
+- [x] Add Antigravity as a tool with `antigravity` and `agy` CLI choices and `[g]` in the TUI Add menu.
+- [x] Create an isolated fake HOME, track and refresh safe top-level links, and copy only warm `.gemini` settings and skills.
+- [x] Verify sign-in from the profile's own token and `agy models`, read only the token's email claim, and keep failures unregistered.
+- [x] Dispatch use, aliases, info and activity checks; keep Claude-only usage, keys, limits, sync and refresh isolated.
+- [x] Cover the flow with synthetic unit and fake-`agy` CLI tests plus hermetic gates.
+
 ## Codex profiles — 2026-10-01
 
 - [x] Add a compatible tool field and isolate unknown registry values.
