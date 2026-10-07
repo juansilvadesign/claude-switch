@@ -1,5 +1,12 @@
 # claude-switch Fork — Build Task Tracker
 
+## Claude Code status line — 2026-10-07
+
+- [x] Render an infallible one-line account, project, plan-limit, headroom, context and chat summary from Claude Code stdin and local profile files.
+- [x] Keep rendering read-only and bounded by terminal width; cover malformed input, fallback snapshots, colors and shedding with synthetic fixtures.
+- [x] Install or uninstall a cswitch-owned status line in registered Claude profiles through the existing backed-up settings editor.
+- [ ] Add ledger-backed daily and per-token figures and a detached refresh in a separate step.
+
 ## Antigravity profiles — 2026-10-05
 
 - [x] Add Antigravity as a tool with `antigravity` and `agy` CLI choices and `[g]` in the TUI Add menu.
