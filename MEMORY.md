@@ -75,7 +75,30 @@ type: project
     - once an empty window gave no estimate, a test with no usage in its fixture passed whatever the code did.
   - A test must fail on its known-bad, not hang. One blocked on a channel that the same thread was to release.
   - What sits in `main`'s dispatch or in the TUI's event loop is out of a unit test's reach. Extract the decision into a function, or drive the built binary.
-- **Next:** Stage C, Antigravity profiles (one fake HOME each). Then Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
+- ✅ **Antigravity profiles (Stage C of the accounts work) shipped 2026-10-06.** Unix only.
+  - `cswitch login <name> --tool antigravity` (or `--tool agy`, or `[g]` in the TUI's Add menu) creates a profile with its own HOME at `profiles/<name>/home/`. Antigravity has no setting that moves its data directory, so `HOME` is the lever.
+  - **The link farm.** Every top-level entry of the real HOME is linked into the profile's HOME, with two exceptions: `.gemini` is the profile's own real directory, and `.claude-switch` is left out because the profiles live inside it. `use` re-links on every launch. It adds links for new entries, removes only dangling links that cswitch itself recorded, and never touches an entry that isn't a link.
+  - **The seed** copies seven entries from the real `.gemini`: the settings file, both MCP configuration files, the three skills directories and Antigravity's migration marker. The login token, the Gemini CLI account files, the installation ids, conversations and history are never copied.
+  - **The login** runs `agy` as a child for the sign-in. It then requires a non-empty token file in the profile, and `agy models` exiting 0. `agy`'s own exit status doesn't count. The email is read offline from the token's `id_token` claim, and a login whose claim can't be read is still registered, without an email.
+  - `use`, the alias (`agy-<name>`), `list`, `info` and the TUI dispatch by tool. `info` shows the profile's HOME, the number of links, the number of dangling links and the local entries.
+  - **Local entries** are files that a program created in the profile's HOME, or a link that a program replaced by renaming a new file over it. They exist only in the profile. `remove` lists them and refuses without `--force`, and the TUI's delete dialog lists them.
+  - Run from inside an Antigravity session, `cswitch` can't see the profile store. It says so in one line and creates nothing.
+  - ⛔ No walk follows a link in the farm: not the live-session warning, not the sizes, not `remove`, not the seed. A careless walk would reach the whole real HOME.
+- **Release notes:**
+  - A build from the Codex stage lists an Antigravity profile as `unknown` and refuses to launch it. It keeps the profile's `tool` value across a registry save.
+  - ⛔ The Codex stage's downgrade warning applies here too. A build without the `tool` field treats an Antigravity profile as Claude. Remove the profile or restore `registry.json` first.
+  - Measured on Antigravity CLI 1.3.0: a logged-in `agy models` exits 0, and a logged-out one exits 1. The token is a file under the profile's `.gemini`, measured on Linux under WSL only.
+  - Antigravity runs a one-time migration on any start that finds no `config/.migrated` marker in `.gemini`. It moves the old-location skills directory and MCP configuration file into `config/`, and the file move replaces a `config/` file that is already there. The seed copies the marker, so the copies stay as they are in the real HOME.
+  - A whole Windows build was not checked on this stage's machine. The non-Unix path is one helper, compiled and tested on every platform.
+- **Lessons (three fix rounds and a live check):**
+  - Seed by mirroring the source, including the marker that says a migration has already run. A copy without it was rewritten by the tool's own first start, and one configuration file replaced another.
+  - Survey a tool's directory one level deeper than the brief seems to need. The allowlist missed a skills directory because the survey stopped at the top level.
+  - Two byte-identical cache directories don't show that two installs load the same things. One side was weeks stale. Read the running processes.
+  - A login verdict belongs to what the login leaves behind (the token, and a status command), never to the interactive tool's exit code.
+  - A `#[cfg(not(unix))]` item is invisible to every gate on a Unix machine. Make its body one call to a helper that is compiled everywhere, and test the helper.
+  - A dialog that lists what will be deleted needs a test with a realistic number of long names, at the smallest supported terminal size.
+  - A prompt loop must end on end-of-file. One spun a core and wrote gigabytes of prompts when its input was closed.
+- **Next:** Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
 
 ## 📚 Detailed history
 
