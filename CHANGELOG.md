@@ -10,6 +10,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Fixed
 
+- **Status line ledger identity and freshness.** Ledger figures and rollup projects appear only for a registered Claude profile or the default account. The line ignores a per-chat rollup whose timestamp differs from the hourly summary and starts a refresh; headroom excludes accounts whose active limit rounds to 100% or more.
 - **Status line snapshots and ownership.** Rendering reads each Claude cache once without a retry delay, reads the default snapshot from the home directory, hides saved limits on per-token profiles, omits the internal `(unattributed)` workspace, and marks old saved figures with their age. A renamed executable recognizes the line it installed.
 - **Adding an account in the TUI no longer silently clones the account you already had.** Pressing `a` used to copy `~/.claude` wholesale — credentials included — so every "new account" came back with the default account's email, by construction. `a` now asks for a name and then which operation you meant: copy the current session, or log in to a different account. The CLI and the first-run screen already offered this choice; the normal TUI did not.
 - **A profile name that was already taken no longer tears down the TUI.** The error surfaces as an in-app message instead of propagating out of the event loop.

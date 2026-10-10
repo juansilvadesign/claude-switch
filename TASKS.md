@@ -6,6 +6,7 @@
 - [x] Keep rendering bounded by terminal width; cover malformed input, one-attempt snapshot reads, saved-figure ages, colors and shedding with synthetic fixtures.
 - [x] Install or uninstall a cswitch-owned status line in registered Claude profiles through the existing backed-up settings editor.
 - [x] Add deduplicated per-chat rollups, ledger-backed daily and per-token figures, and a detached refresh after printing.
+- [x] Tie ledger figures to known accounts and matching rollup timestamps, exclude exhausted headroom accounts, and cover refresh detachment and money/project ownership with synthetic tests.
 
 ## Antigravity profiles — 2026-10-05
 
