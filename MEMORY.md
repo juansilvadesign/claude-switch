@@ -98,7 +98,33 @@ type: project
   - A `#[cfg(not(unix))]` item is invisible to every gate on a Unix machine. Make its body one call to a helper that is compiled everywhere, and test the helper.
   - A dialog that lists what will be deleted needs a test with a realistic number of long names, at the smallest supported terminal size.
   - A prompt loop must end on end-of-file. One spun a core and wrote gigabytes of prompts when its input was closed.
-- **Next:** Phase 4, a status line, which needs an incremental path faster than rewriting the whole ledger.
+- ✅ **The Claude Code status line (Phase 4 of the usage work) shipped 2026-10-10.**
+  - `cswitch statusline` prints one line for Claude Code's status row, from the JSON that Claude Code passes on stdin and from local files: the account, the project, the 5-hour and 7-day plan limits with their reset times, another account's headroom, the context size, the chat's cost and today's cost. It never wraps. On a narrow terminal it drops fields in a fixed order.
+  - **Limits** come live from stdin. A session's first run has none, so a subscription profile falls back to its saved snapshot, and a figure older than five minutes carries its age. A per-token profile has no fallback.
+  - **Headroom.** Once the current account reaches 80% on either limit, the line names the registered subscription account with the most 5-hour room. It never names an account whose active 5-hour or weekly window rounds to 100% or more.
+  - **Money.** `chat ~$` is Claude Code's own running estimate. `today ~$` is the ledger's list-price value for the local day, plus the part of this chat that the ledger hasn't recorded yet. A per-token profile shows both from the ledger at its configured rate, without the `~`.
+  - **The line never ingests.** It prints first. If the ledger is over five minutes old, it then starts one detached `cswitch usage refresh`, at most one a minute, and exits. `--no-refresh` turns that off. The refresh writes a per-chat rollup, `chats.json`, beside `hourly.json`, with one timestamp in both.
+  - **Guards.** Ledger figures and the rollup's project appear only for a registered Claude profile or the default account. A config directory that only shares a profile's name gets neither. A rollup whose timestamp differs from the hourly summary's is ignored until a refresh has rewritten both.
+  - **Install.** `cswitch statusline --install <name>` (or `--all`) writes the one `statusLine` key into the profile's `settings.json`, after a backup. It refuses to replace another command's line without `--force`, and `--uninstall` removes only a line that cswitch installed.
+  - The render can't blank the row: it reads at most 1 MiB of stdin, tries each file once, and a panic prints a fallback line.
+- **Release notes:**
+  - The installed command holds the absolute path of the executable that ran `--install`. Install from the executable's permanent location, never from a build directory.
+  - Install rewrites `settings.json` with its keys sorted. The values and the file mode are kept, but a diff shows every line moved.
+  - An older build renews `hourly.json` without `chats.json`. With two builds on one ledger, the line hides ledger figures until its own refresh has rewritten both files.
+  - Claude Code 2.1.296 runs the command once when a session starts, before it has any plan limits. So a session's first line shows the saved snapshot with its age.
+  - Measured on Linux under WSL: with three profiles, 95 runs in 100 take 14 ms or less. The headroom reads every Claude profile's cache, and with 34 profiles a run took about 60 ms.
+  - A refresh rewrites every month's request file, including the months whose bytes don't change, so it takes seconds on a ledger of several months. It is detached, and the line never waits for it.
+  - The refresh child's detachment is tested on Linux only. The Windows path sets the detached-process flags and was not run.
+- **Lessons (two parts, one fix round and two live checks):**
+  - Two builds can share one ledger. A file that only the newer build writes goes stale as soon as the older one runs, and adding the two sources then counted a request twice. Write both files with one timestamp, and compare the timestamps on every read.
+  - A figure looked up by a directory's name belongs to anyone who shares the name. An unregistered config directory named like a profile showed that profile's money. Look up by the registered identity.
+  - "The account with the most room" has to check every limit, not only the one it ranks by. The line offered an account whose week was used up, because its 5-hour window was the emptiest.
+  - A saved figure without its age reads as live. A session's first line showed a weekly figure from a snapshot more than a day old, far below the live one.
+  - A profile switched to per-token billing keeps its old plan snapshot in the cache. Check the billing mode before reading it.
+  - A retry meant for a file caught in mid-write also runs on a file that is simply broken. It added 50 to 100 ms to every run until the line took one attempt.
+  - A child isn't detached until a test kills the parent's process group and the child still finishes. Three ways of breaking the detachment survived the first suite.
+  - Every commit must pass the lints on its own. One commit failed them on code that only the next commit used, and a check of the tip can't see that.
+- **Next:** nothing is planned. Two small items stay open: a refresh that rewrites only the months that changed, and a first whole Windows build, which the next `v*` tag runs.
 
 ## 📚 Detailed history
 
