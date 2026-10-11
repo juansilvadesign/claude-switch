@@ -124,7 +124,24 @@ type: project
   - A retry meant for a file caught in mid-write also runs on a file that is simply broken. It added 50 to 100 ms to every run until the line took one attempt.
   - A child isn't detached until a test kills the parent's process group and the child still finishes. Three ways of breaking the detachment survived the first suite.
   - Every commit must pass the lints on its own. One commit failed them on code that only the next commit used, and a check of the tip can't see that.
-- **Next:** nothing is planned. Two small items stay open: a refresh that rewrites only the months that changed, and a first whole Windows build, which the next `v*` tag runs.
+- ✅ **Price cards by prompt length (the usage work) shipped 2026-10-11.**
+  - A model in `rates.json` may carry a second card, `long_prompt`, with its own `over_tokens`. A request whose prompt is longer than that is priced on the second card. The prompt length is the input tokens plus both cache writes plus the cache reads. Output doesn't count, and a prompt of exactly `over_tokens` stays on the first card.
+  - **Each request is classified on its own, when the rollups are written.** A row of `hourly.json` or `chats.json` for a two-card model carries a `prompt_tier` field: the threshold, and the side of it that the row's requests fell on. The field is part of the row's key, so one hour or one chat can hold a row for each card. A model with one card gets no such field, and its rows are as before.
+  - **It fails closed.** A row with no `prompt_tier`, or with a threshold other than the table's, has no price and shows the `*` until the next `cswitch usage refresh` rewrites it. A fast request over the threshold has no price either when the model has no fast long card.
+  - A per-token profile's configured rate ignores the second card. Only the list price is tiered.
+  - The seed gains Claude Haiku 5.5 with both of its cards, Sonnet 5.5 and Fable 5.1, as read from Anthropic's price page on 2026-10-10.
+- **Release notes:**
+  - An existing `rates.json` is never rewritten. Add the new models by hand in the README's shape, then run `cswitch usage refresh`.
+  - ⛔ **Take a two-card entry out of `rates.json` before you downgrade.** A build older than this one ignores `long_prompt`. It prices every request of that model on the first card and shows no `*`.
+  - For the same reason, install this build before a two-card model goes into a `rates.json` that an older build still reads.
+  - Measured on one ledger: with a table that holds no two-card model, this build prints what the previous one printed and writes the same rollup rows.
+  - The price page lists a 1.1x multiplier for US-only inference. The rate table has none, so such a request is priced at the global rate.
+- **Lessons (one build, no fix round):**
+  - A price can be more than a row. This model's second card was in a note under the table. Read a price page's notes before sizing a rate change, and read the page again before changing a number.
+  - A rollup that adds requests together loses whatever the price depends on. Each request's prompt length was gone by the time a row was priced. Classify when the row is written, and put the class in the row's key.
+  - A field that an older build ignores can make that build wrong without a mark. Check what the installed build does with the new file before editing the file.
+  - A test list written from a design's rules misses what the design only forbids in passing. Three mutations survived the suite: a `null` second card in a seeded file, a fast request under the threshold, and a configured flat rate that takes the second card.
+- **Next:** nothing is planned. Three small items stay open: tests for those three cases, a refresh that rewrites only the months that changed, and a first whole Windows build, which the next `v*` tag runs.
 
 ## 📚 Detailed history
 
