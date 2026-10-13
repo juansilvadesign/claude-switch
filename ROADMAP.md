@@ -29,7 +29,7 @@ A [second fork](https://github.com/m2selfA/claude-switch) is 44 commits ahead of
 | R16 | **`doctor` command** | R7, parking lot | Their `DiagnosticLevel` / `DiagnosticItem` / `DoctorReport` shape is a good model for the diagnostics R7 wants and the `doctor` command already in the parking lot. Borrow the design, not the code — their implementation is welded to their profile-kind, provider and shim architecture. |
 | R17 | **`duplicate <source> <new>`** | R1, R12 | The Copy-vs-Login work established "second environment, same account" as a first-class case. A named command expresses it directly instead of asking users to reason their way to `add` → `[c]`. |
 | R18 | **`export` / `import` / `validate`** | R6 | R6 notes the backend primitive (`add_profile_from`) exists with no public flow. This is that flow, and `validate` is the identity-and-collision checking R6 asks for. |
-| R19 | **`statusline` / `current`** | Parking lot | "A read-only command showing which profile a terminal is currently using" — worth more now that running several profiles at once is documented behaviour rather than a side effect. |
+| R19 | **`statusline` / `current`** | Parking lot | **`statusline` shipped:** Claude Code's status row names the profile (README, "Status line"). Still open, for a plain shell: "A read-only command showing which profile a terminal is currently using" — worth more now that running several profiles at once is documented behaviour rather than a side effect. |
 | R20 | **Separate display name from CLI alias** | Profile naming | Their `add --alias` lets the profile name be arbitrary text while a separate alias stays shell- and path-safe. This fork restricts names to `[A-Za-z0-9_-]` only because the name doubles as a directory name. Small change, removes a real limitation, no architectural risk — probably the cheapest win in this table. |
 | R21 | **Lightweight (env-var) profiles alongside full ones** | Profile model | `add <name>` for env-var isolation, `add --full <name>` for directory isolation. Sidesteps warm-state seeding entirely for anyone who only needs to swap credentials. **Think hard before taking this**: it is a second profile model to maintain permanently, and it cuts against this fork's premise that `CLAUDE_CONFIG_DIR` isolation *is* the product. Listed because it is genuinely valuable, not because it is obviously right. |
 
@@ -57,7 +57,7 @@ Each keeps this fork's premise that one profile is one isolated config environme
 
 - Optional color/icon labels for work, personal, and client profiles.
 - Sort by last used, name, or account identity.
-- A read-only command showing which profile a terminal is currently using.
+- A read-only command showing which profile a terminal is currently using, outside Claude Code (inside it, `cswitch statusline` names the profile).
 - A `doctor` command for Claude binary availability, config permissions, and credential-store access.
 - Configurable default profile when launching `cswitch use` without a name.
 - TUI mouse support and responsive behavior for very small terminals.

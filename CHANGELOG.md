@@ -38,6 +38,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Changed
 
+- **`usage verify` names a sub-agent shortfall and adds up every class of difference, in tokens and dollars.** Wherever a sub-agent ran, the ledger's dollars are a floor: Claude Code often writes a sub-agent's request to the transcript only as its response starts.
 - **Missing profile emails show `—` in `info` and the TUI.** Claude and Codex profiles previously showed `unknown` there.
 - **Shell aliases run `cswitch use`.** They sync skills before launch and pass Claude flags through.
 - **Unix launches use `exec`.** Claude takes over the process, preserving its PID, signals, and exit code.
