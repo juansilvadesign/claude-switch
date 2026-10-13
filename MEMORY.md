@@ -141,7 +141,22 @@ type: project
   - A rollup that adds requests together loses whatever the price depends on. Each request's prompt length was gone by the time a row was priced. Classify when the row is written, and put the class in the row's key.
   - A field that an older build ignores can make that build wrong without a mark. Check what the installed build does with the new file before editing the file.
   - A test list written from a design's rules misses what the design only forbids in passing. Three mutations survived the suite: a `null` second card in a seeded file, a fast request under the threshold, and a configured flat rate that takes the second card.
-- **Next:** nothing is planned. Three small items stay open: tests for those three cases, a refresh that rewrites only the months that changed, and a first whole Windows build, which the next `v*` tag runs.
+- ✅ **`usage verify` says the sub-agent shortfall (the usage work) shipped 2026-10-13.**
+  - Claude Code often writes a sub-agent's request to the transcript only as its response starts: `stop_reason` null, no `speed`, and an output of a few tokens. Often no final record follows. Its cost state also counts requests that no transcript holds. So wherever a sub-agent ran, the ledger's dollars are a floor, and nothing in the files can recover the rest.
+  - `verify` puts each (session, model) pair of a cost state in one of five classes, from its rows' four token sums against the cost state's: `equal`, `sub-agent shortfall` (no sum above, one below, and at least one sub-agent row), `main-loop shortfall` (the same with no sub-agent row), `rows above or mixed`, and `no transcript requests`. A session that `verify` excludes is in no class.
+  - A sub-agent shortfall gets its own line: rows against cost state in dollars, and how many of the pair's sub-agent rows hold a start-of-response usage (a sub-agent row with no `speed`). Every other line, the count line, the footer and the exit codes are as before.
+  - A totals block before the count line adds up each class: pairs, cost state, rows, the short and its share of the cost state, then the four token kinds on both sides. An unpriced row is left out of the rows and marked with a `*`.
+  - The README says where the dollar column is a floor, and `ROADMAP.md` R19 now records the status line as shipped.
+- **Release notes:**
+  - Only `usage verify` prints anything new. Measured on a copy of one ledger, every other command and view, the status line, the rollups and `rates.json` are byte-identical to the previous build's.
+  - A shortfall is not a failed rate check, so the exit code doesn't change.
+  - Nothing tops the dollars up from the cost state. A forked session's cost state repeats its sibling's requests, so cost states can't be added up across sessions. A top-up would have to work request by request.
+  - When float rounding puts a pair's rows a hair above its cost state, its short prints as `$-0.0000 (-0.0%)`.
+- **Lessons (one build, no fix round):**
+  - A gap between two counts is not an ingest bug until a record is found missing. Here the ledger held every request that the transcripts hold, and the missing tokens were in no file.
+  - A search for a counter by the key names you know is circular. List the record types and their keys first: a completion notice's `totalTokens` passed a check that looked for `input_tokens`.
+  - A test with one pair per class can't tell a pair's own figures from the class's running sums. Four mutations survived the suite: a per-pair line printing the class's rows, cost state or row counts, and the unpriced count kept from the class's last pair only.
+- **Next:** nothing is planned. Small items stay open: tests for the three rates cases and for two pairs in one `verify` class, a refresh that rewrites only the months that changed, and a first whole Windows build, which the next `v*` tag runs.
 
 ## 📚 Detailed history
 
