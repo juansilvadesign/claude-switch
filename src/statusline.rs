@@ -1,5 +1,6 @@
 //! Claude Code's one-line, read-only status display.
 
+use crate::codex;
 use crate::key;
 use crate::limits::{self, Limits, Snapshot, read_claude_json_once};
 use crate::profile::{self, ProfileManager, Tool};
@@ -28,6 +29,7 @@ pub struct DiskData {
 
 #[derive(Clone, Debug)]
 struct Headroom {
+    tool: Tool,
     name: String,
     five_percent: f64,
     five_reset: bool,
@@ -338,6 +340,23 @@ pub fn read_disk(
                         .total_cmp(&b.five_percent)
                         .then_with(|| a.name.cmp(&b.name))
                 })
+                .or_else(|| {
+                    std::iter::once(("default", home.join(".codex")))
+                        .chain(
+                            profiles
+                                .iter()
+                                .filter(|profile| profile.tool == Tool::Codex)
+                                .map(|profile| {
+                                    (profile.name.as_str(), manager.profile_dir(&profile.name))
+                                }),
+                        )
+                        .filter_map(|(name, dir)| codex_candidate(name, &dir, now))
+                        .min_by(|a, b| {
+                            a.five_percent
+                                .total_cmp(&b.five_percent)
+                                .then_with(|| a.name.cmp(&b.name))
+                        })
+                })
         })
     } else {
         None
@@ -423,6 +442,39 @@ fn candidate(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Option
         .filter(|window| !window.rolled_over(now) && window.percent >= 80.0)
         .map(|window| window.percent);
     Some(Headroom {
+        tool: Tool::Claude,
+        name: clean(name),
+        five_percent: if five_reset { 0.0 } else { five.percent },
+        five_reset,
+        weekly_percent,
+        fetched_at: snapshot.fetched_at,
+    })
+}
+
+fn codex_candidate(name: &str, dir: &Path, now: DateTime<Utc>) -> Option<Headroom> {
+    let account_id = fs::read(dir.join("auth.json"))
+        .ok()
+        .and_then(|bytes| codex::account_id_from_auth(&bytes));
+    let Limits::Snapshot(snapshot) = codex::read_limits(dir, account_id.as_deref()) else {
+        return None;
+    };
+    let five = snapshot.session()?;
+    let five_reset = five.rolled_over(now);
+    if !five_reset && five.percent.round() >= 100.0 {
+        return None;
+    }
+    if snapshot
+        .weekly()
+        .is_some_and(|window| !window.rolled_over(now) && window.percent.round() >= 100.0)
+    {
+        return None;
+    }
+    let weekly_percent = snapshot
+        .weekly()
+        .filter(|window| !window.rolled_over(now) && window.percent >= 80.0)
+        .map(|window| window.percent);
+    Some(Headroom {
+        tool: Tool::Codex,
         name: clean(name),
         five_percent: if five_reset { 0.0 } else { five.percent },
         five_reset,
@@ -804,7 +856,12 @@ pub fn render(
     let mut seven = seven_window.map(|window| window_text("7d", window, colour, now, offset));
     let mut headroom = disk.headroom.as_ref().map(|candidate| HeadroomText {
         base: format!(
-            "→ {} 5h {}",
+            "→ {}{} 5h {}",
+            if candidate.tool == Tool::Codex {
+                "codex "
+            } else {
+                ""
+            },
             candidate.name,
             if candidate.five_reset {
                 "reset".to_string()
@@ -1148,6 +1205,227 @@ mod tests {
         let disk = read_disk(&Value::Null, home, Some(&work), &usage);
         assert_eq!(limits::read_stats(), (1, 0));
         assert!(line(&Value::Null, &disk, 200, false).contains("5h 42%"));
+    }
+
+    #[test]
+    fn codex_headroom_is_claude_first_and_names_the_tool() {
+        // Known-bads: reading Codex before Claude, omitting the tool, offering a full window, or reading CODEX_HOME.
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        register(
+            home,
+            &[
+                ("work", Tool::Claude),
+                ("spare", Tool::Claude),
+                ("spare-gpt", Tool::Codex),
+            ],
+        );
+        let profiles = home.join(".claude-switch/profiles");
+        let work = profiles.join("work");
+        let spare = profiles.join("spare");
+        let codex_home = profiles.join("spare-gpt");
+        let usage = home.join("usage");
+        let input = json!({"rate_limits":{"five_hour":{"used_percentage":90}}});
+        let low = json!({"rate_limits":{"five_hour":{"used_percentage":79.9}}});
+        fs::write(
+            spare.join(".claude.json"),
+            serde_json::to_vec(&snapshot(
+                40.0,
+                now().timestamp() + 3600,
+                20.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex_report = |five: f64, weekly: f64, reset: i64| {
+            crate::codex_tests::session(
+                &codex_home,
+                1,
+                None,
+                &[crate::codex_tests::event(
+                    "2030-01-01T10:00:00Z",
+                    "codex",
+                    crate::codex_tests::window(300, json!(five), Some(reset)),
+                    crate::codex_tests::window(
+                        10_080,
+                        json!(weekly),
+                        Some(now().timestamp() + 86400),
+                    ),
+                )],
+                "2030-01-01T13:00:00Z",
+            );
+        };
+        codex_report(3.0, 85.0, now().timestamp() + 3600);
+        codex::reset_read_stats();
+        let disk = read_disk(&input, home, Some(&work), &usage);
+        assert!(line(&input, &disk, 200, false).contains("→ spare 5h 40%"));
+        assert_eq!(codex::read_stats(), 0);
+
+        fs::remove_file(spare.join(".claude.json")).unwrap();
+        let disk = read_disk(&input, home, Some(&work), &usage);
+        let output = line(&input, &disk, 200, false);
+        assert!(
+            output.contains("→ codex spare-gpt 5h 3% 7d 85% (2h)"),
+            "{output}"
+        );
+
+        fs::write(
+            spare.join(".claude.json"),
+            serde_json::to_vec(&snapshot(
+                100.0,
+                now().timestamp() + 3600,
+                20.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            line(
+                &input,
+                &read_disk(&input, home, Some(&work), &usage),
+                200,
+                false
+            )
+            .contains("→ codex spare-gpt 5h 3%")
+        );
+
+        codex_report(99.5, 20.0, now().timestamp() + 3600);
+        assert!(
+            !line(
+                &input,
+                &read_disk(&input, home, Some(&work), &usage),
+                200,
+                false
+            )
+            .contains('→')
+        );
+        codex_report(3.0, 100.0, now().timestamp() + 3600);
+        assert!(
+            !line(
+                &input,
+                &read_disk(&input, home, Some(&work), &usage),
+                200,
+                false
+            )
+            .contains('→')
+        );
+        codex_report(42.0, 20.0, now().timestamp() - 3600);
+        assert!(
+            line(
+                &input,
+                &read_disk(&input, home, Some(&work), &usage),
+                200,
+                false
+            )
+            .contains("→ codex spare-gpt 5h reset")
+        );
+
+        codex::reset_read_stats();
+        assert!(
+            !line(
+                &low,
+                &read_disk(&low, home, Some(&work), &usage),
+                200,
+                false
+            )
+            .contains('→')
+        );
+        assert_eq!(codex::read_stats(), 0);
+
+        let plain = TempDir::new().unwrap();
+        register(plain.path(), &[("work", Tool::Claude)]);
+        let plain_work = plain.path().join(".claude-switch/profiles/work");
+        crate::codex_tests::session(
+            &plain.path().join(".codex"),
+            1,
+            None,
+            &[crate::codex_tests::event(
+                "2030-01-01T10:00:00Z",
+                "codex",
+                crate::codex_tests::window(300, json!(3), None),
+                Value::Null,
+            )],
+            "2030-01-01T13:00:00Z",
+        );
+        let output = line(
+            &input,
+            &read_disk(
+                &input,
+                plain.path(),
+                Some(&plain_work),
+                &plain.path().join("usage"),
+            ),
+            200,
+            false,
+        );
+        assert!(output.contains("→ codex default 5h 3%"), "{output}");
+        register(
+            plain.path(),
+            &[("work", Tool::Claude), ("spare", Tool::Codex)],
+        );
+        crate::codex_tests::session(
+            &plain.path().join(".claude-switch/profiles/spare"),
+            1,
+            None,
+            &[crate::codex_tests::event(
+                "2030-01-01T10:00:00Z",
+                "codex",
+                crate::codex_tests::window(300, json!(3), None),
+                Value::Null,
+            )],
+            "2030-01-01T13:00:00Z",
+        );
+        let output = line(
+            &input,
+            &read_disk(
+                &input,
+                plain.path(),
+                Some(&plain_work),
+                &plain.path().join("usage"),
+            ),
+            200,
+            false,
+        );
+        assert!(output.contains("→ codex default 5h 3%"), "{output}");
+
+        let tied = TempDir::new().unwrap();
+        register(
+            tied.path(),
+            &[
+                ("work", Tool::Claude),
+                ("beta", Tool::Codex),
+                ("alpha", Tool::Codex),
+            ],
+        );
+        for name in ["alpha", "beta"] {
+            crate::codex_tests::session(
+                &tied.path().join(".claude-switch/profiles").join(name),
+                1,
+                None,
+                &[crate::codex_tests::event(
+                    "2030-01-01T10:00:00Z",
+                    "codex",
+                    crate::codex_tests::window(300, json!(3), None),
+                    Value::Null,
+                )],
+                "2030-01-01T13:00:00Z",
+            );
+        }
+        let tied_work = tied.path().join(".claude-switch/profiles/work");
+        let output = line(
+            &input,
+            &read_disk(
+                &input,
+                tied.path(),
+                Some(&tied_work),
+                &tied.path().join("usage"),
+            ),
+            200,
+            false,
+        );
+        assert!(output.contains("→ codex alpha 5h 3%"), "{output}");
     }
 
     #[test]
@@ -2188,6 +2466,7 @@ mod tests {
             _ => unreachable!(),
         };
         disk.headroom = Some(Headroom {
+            tool: Tool::Claude,
             name: "spare".into(),
             five_percent: 10.0,
             five_reset: false,
@@ -3022,6 +3301,7 @@ mod tests {
         input["rate_limits"]["five_hour"]["used_percentage"] = json!(88);
         let mut data = disk();
         data.headroom = Some(Headroom {
+            tool: Tool::Claude,
             name: "spare".into(),
             five_percent: 10.0,
             five_reset: false,

@@ -57,6 +57,12 @@ pub enum Limits {
     Unreadable,
 }
 
+#[derive(Clone, Copy)]
+pub enum LimitSource {
+    Claude,
+    Codex,
+}
+
 pub fn parse_limits(claude_json: &Value) -> Limits {
     let Some(cache) = claude_json.get("cachedUsageUtilization") else {
         return Limits::NoSnapshot;
@@ -275,20 +281,41 @@ impl Window {
     }
 }
 
-pub fn format_info(limits: &Limits, now: DateTime<Utc>) -> String {
+pub fn format_info(limits: &Limits, now: DateTime<Utc>, source: LimitSource) -> String {
     match limits {
-        Limits::NoSnapshot => {
-            "Plan limits: Claude Code hasn't cached one for this profile yet.\n".to_string()
-        }
-        Limits::AccountMismatch => {
-            "Plan limits: the snapshot belongs to another account, so it's hidden.\n".to_string()
-        }
-        Limits::Unreadable => "Plan limits: the file couldn't be read.\n".to_string(),
+        Limits::NoSnapshot => match source {
+            LimitSource::Claude => {
+                "Plan limits: Claude Code hasn't cached one for this profile yet.\n".to_string()
+            }
+            LimitSource::Codex => {
+                "Plan limits: no Codex session has reported one yet.\n".to_string()
+            }
+        },
+        Limits::AccountMismatch => match source {
+            LimitSource::Claude => {
+                "Plan limits: the snapshot belongs to another account, so it's hidden.\n"
+                    .to_string()
+            }
+            LimitSource::Codex => {
+                "Plan limits: the last report belongs to another account, so it's hidden.\n"
+                    .to_string()
+            }
+        },
+        Limits::Unreadable => match source {
+            LimitSource::Claude => "Plan limits: the file couldn't be read.\n".to_string(),
+            LimitSource::Codex => "Plan limits: the session files couldn't be read.\n".to_string(),
+        },
         Limits::Snapshot(snapshot) => {
-            let mut output = format!(
-                "Plan limits (Claude Code's snapshot, fetched {}):\n",
-                snapshot.age(now)
-            );
+            let mut output = match source {
+                LimitSource::Claude => format!(
+                    "Plan limits (Claude Code's snapshot, fetched {}):\n",
+                    snapshot.age(now)
+                ),
+                LimitSource::Codex => format!(
+                    "Plan limits (Codex's last report, {}):\n",
+                    snapshot.age(now)
+                ),
+            };
             if snapshot.windows.is_empty() {
                 output.push_str("  No limit windows in this snapshot.\n");
             }
@@ -441,8 +468,12 @@ mod tests {
         assert_eq!(result.windows.len(), 3);
         assert_eq!(result.weekly().unwrap().kind, "weekly_all");
         assert!(
-            format_info(&Limits::Snapshot(result), at("2030-01-07T14:00:00Z"))
-                .contains("weekly opus")
+            format_info(
+                &Limits::Snapshot(result),
+                at("2030-01-07T14:00:00Z"),
+                LimitSource::Claude
+            )
+            .contains("weekly opus")
         );
     }
 
@@ -453,7 +484,11 @@ mod tests {
         let session = result.session().unwrap();
         assert_eq!(session.percent_label(at("2030-01-07T14:00:00Z")), "12%");
         assert_eq!(session.percent_label(at("2030-01-07T16:00:00Z")), "reset");
-        let info = format_info(&Limits::Snapshot(result), at("2030-01-07T16:00:00Z"));
+        let info = format_info(
+            &Limits::Snapshot(result),
+            at("2030-01-07T16:00:00Z"),
+            LimitSource::Claude,
+        );
         assert!(info.contains("reset since the snapshot (was 12%)"));
     }
 
@@ -464,7 +499,7 @@ mod tests {
         value["cachedUsageUtilization"]["accountUuid"] = json!(OTHER_ACCOUNT);
         let limits = parse_limits(&value);
         assert_eq!(limits, Limits::AccountMismatch);
-        let info = format_info(&limits, at("2030-01-07T14:00:00Z"));
+        let info = format_info(&limits, at("2030-01-07T14:00:00Z"), LimitSource::Claude);
         assert!(info.contains("another account"));
         assert!(!info.contains("88%"));
         assert!(!info.contains(OTHER_ACCOUNT));
@@ -480,7 +515,7 @@ mod tests {
         fs::write(&path, b"{\"private_canary\":").unwrap();
         let limits = read_limits(tmp.path());
         assert_eq!(limits, Limits::Unreadable);
-        let info = format_info(&limits, at("2030-01-07T14:00:00Z"));
+        let info = format_info(&limits, at("2030-01-07T14:00:00Z"), LimitSource::Claude);
         assert!(info.contains("couldn't be read"));
         assert!(!info.contains("private_canary"));
     }

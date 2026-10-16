@@ -1,5 +1,12 @@
 # claude-switch Fork — Build Task Tracker
 
+## Codex limits and usage — 2026-10-14
+
+- [x] Read Codex session tails offline for plan windows, age and account matching.
+- [x] Show Codex plan limits in list, info and the TUI without changing Claude views.
+- [x] Offer a Codex profile or the plain Codex home when no Claude account qualifies for the status-line hint.
+- [x] Cover Codex limits and the hint with synthetic, hermetic unit and built-binary tests.
+
 ## Claude Code status line — 2026-10-07
 
 - [x] Render an infallible one-line account, project, plan-limit, headroom, context and chat summary from Claude Code stdin and local profile files.

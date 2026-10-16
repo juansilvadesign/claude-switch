@@ -1,6 +1,27 @@
-//! Offline identity extraction from a Codex home. Token bytes never leave this module.
+//! Offline identity and plan limits from a Codex home. Token bytes never leave this module.
 
+use crate::limits::{Limits, Snapshot, Window, WindowGroup};
+use crate::usage::ledger::transcript_files;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    static READ_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn reset_read_stats() {
+    READ_ATTEMPTS.set(0);
+}
+
+#[cfg(test)]
+pub fn read_stats() -> usize {
+    READ_ATTEMPTS.get()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
@@ -36,6 +57,184 @@ pub fn identity_from_auth(bytes: &[u8]) -> Option<Identity> {
     Some(Identity {
         email: email.to_string(),
         plan_type,
+    })
+}
+
+pub fn account_id_from_auth(bytes: &[u8]) -> Option<String> {
+    let auth: Value = serde_json::from_slice(bytes).ok()?;
+    let token = auth.get("tokens")?.get("id_token")?.as_str()?;
+    jwt_claims(token)?
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Read only session tails. Codex homes are never modified by this reader.
+pub fn read_limits(codex_home: &Path, account_id: Option<&str>) -> Limits {
+    let mut paths = Vec::new();
+    let root = codex_home.join("sessions");
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if !metadata.is_dir() => return Limits::NoSnapshot,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Limits::NoSnapshot,
+        Err(_) => return Limits::Unreadable,
+    }
+    if let Err(error) = transcript_files(&root, &mut paths) {
+        return if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            Limits::NoSnapshot
+        } else {
+            Limits::Unreadable
+        };
+    }
+    let mut files = paths
+        .into_iter()
+        .filter_map(|path| {
+            fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| (modified, path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| b.cmp(a));
+
+    let mut best: Option<(DateTime<Utc>, Value, PathBuf)> = None;
+    for (modified, path) in files {
+        if best
+            .as_ref()
+            .is_some_and(|(at, _, _)| DateTime::<Utc>::from(modified) < *at)
+        {
+            break;
+        }
+        #[cfg(test)]
+        READ_ATTEMPTS.set(READ_ATTEMPTS.get() + 1);
+        let Some((at, rate_limits)) = last_limit_event(&path) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(previous, _, _)| at > *previous) {
+            best = Some((at, rate_limits, path));
+        }
+    }
+
+    let Some((fetched_at, rate_limits, path)) = best else {
+        return Limits::NoSnapshot;
+    };
+    if let (Some(expected), Some(actual)) = (account_id, creator_account_id(&path))
+        && expected != actual
+    {
+        return Limits::AccountMismatch;
+    }
+    let windows = ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|key| rate_limits.get(key).and_then(parse_limit_window))
+        .collect();
+    Limits::Snapshot(Snapshot {
+        fetched_at,
+        windows,
+        window_started_at: None,
+    })
+}
+
+fn last_limit_event(path: &Path) -> Option<(DateTime<Utc>, Value)> {
+    const TAIL: u64 = 1 << 20;
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL);
+    let cut_first = if start > 0 {
+        let mut before = [0];
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
+        file.read_exact(&mut before).ok()?;
+        before[0] != b'\n'
+    } else {
+        false
+    };
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = vec![0; (len - start) as usize];
+    file.read_exact(&mut tail).ok()?;
+    let first = if cut_first {
+        tail.iter().position(|byte| *byte == b'\n')? + 1
+    } else {
+        0
+    };
+    let end = tail.iter().rposition(|byte| *byte == b'\n')?;
+    if first > end {
+        return None;
+    }
+    for line in tail[first..end].rsplit(|byte| *byte == b'\n') {
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        let Some(rate_limits) = payload.get("rate_limits") else {
+            continue;
+        };
+        if rate_limits.get("limit_id").and_then(Value::as_str) != Some("codex") {
+            continue;
+        }
+        let Some(at) = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        else {
+            continue;
+        };
+        return Some((at.with_timezone(&Utc), rate_limits.clone()));
+    }
+    None
+}
+
+fn creator_account_id(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut first = Vec::new();
+    BufReader::new(file.take(64 * 1024))
+        .read_until(b'\n', &mut first)
+        .ok()?;
+    if !first.ends_with(b"\n") {
+        return None;
+    }
+    let record: Value = serde_json::from_slice(&first).ok()?;
+    if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    record
+        .get("payload")?
+        .get("creator_account_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn parse_limit_window(value: &Value) -> Option<Window> {
+    let minutes = value.get("window_minutes")?.as_i64()?;
+    let percent = value.get("used_percent")?.as_f64()?;
+    let (group, kind) = match minutes {
+        300 => (WindowGroup::Session, "session".to_string()),
+        10_080 => (WindowGroup::Weekly, "weekly_all".to_string()),
+        other => (
+            WindowGroup::Other(String::new()),
+            format!("window_{other}min"),
+        ),
+    };
+    Some(Window {
+        group,
+        kind,
+        percent,
+        severity: None,
+        resets_at: value
+            .get("resets_at")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0)),
+        is_active: None,
     })
 }
 
@@ -228,6 +427,20 @@ mod tests {
         assert_eq!(
             identity_from_auth(br#"{"tokens":{"id_token":"h.@@.s"}}"#),
             None
+        );
+    }
+
+    #[test]
+    fn account_id_comes_only_from_id_token_claim() {
+        // Known-bad: an unrelated account_id field is trusted instead of the id token.
+        let claims = br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"00000000-0000-4000-8000-000000000001"}}"#;
+        let auth = format!(
+            r#"{{"tokens":{{"id_token":"h.{}.s","account_id":"00000000-0000-4000-8000-000000000002","access_token":"ignored","refresh_token":"ignored"}}}}"#,
+            encode(claims)
+        );
+        assert_eq!(
+            account_id_from_auth(auth.as_bytes()).as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
         );
     }
 }

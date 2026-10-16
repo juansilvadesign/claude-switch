@@ -1,6 +1,8 @@
 mod agy;
 mod atomic;
 mod codex;
+#[cfg(test)]
+mod codex_tests;
 mod gateway;
 mod key;
 mod limits;
@@ -13,7 +15,7 @@ mod usage;
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use limits::{Limits, Window, format_info, parse_limits, read_claude_json};
+use limits::{LimitSource, Limits, Window, format_info, parse_limits, read_claude_json};
 use profile::{LoginMethod, LoginOutcome, ProfileManager, Tool, detect_current_account};
 use skills_sync::{SyncAction, SyncOptions, SyncReport};
 use std::ffi::OsString;
@@ -1087,7 +1089,7 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
         let limits = claude
             .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
             .unwrap_or(Limits::Unreadable);
-        output.push_str(&format_info(&limits, now));
+        output.push_str(&format_info(&limits, now, LimitSource::Claude));
         let usage_dir = usage_directory(manager);
         output.push_str(&usage_info(
             &usage_dir,
@@ -1105,6 +1107,11 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                 .and_then(|identity| identity.plan_type)
                 .unwrap_or_else(|| "—".into());
             output.push_str(&format!("Plan:      {plan}\n"));
+            let account_id = std::fs::read(dir.join("auth.json"))
+                .ok()
+                .and_then(|bytes| codex::account_id_from_auth(&bytes));
+            let limits = codex::read_limits(&dir, account_id.as_deref());
+            output.push_str(&format_info(&limits, now, LimitSource::Codex));
         } else if profile.tool == Tool::Antigravity {
             output.push_str(&format!(
                 "Home:      {}\n",
@@ -1127,7 +1134,9 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                 Err(_) => output.push_str("Farm:      unavailable\nLocal:     —\n"),
             }
         }
-        output.push_str("Plan limits: —\n");
+        if profile.tool != Tool::Codex {
+            output.push_str("Plan limits: —\n");
+        }
     }
     output.push_str(&format!(
         "Added:     {}\nLast used: {}\nDirectory: {}\n\nLaunch:\n  cswitch use {}\n",
@@ -1409,7 +1418,25 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             .last_used
             .map(|t| t.format("%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".into());
-        let (session, weekly, age, cell) = if p.tool != Tool::Claude {
+        let (session, weekly, age, cell) = if p.tool == Tool::Codex {
+            let dir = manager.profile_dir(&p.name);
+            let account_id = std::fs::read(dir.join("auth.json"))
+                .ok()
+                .and_then(|bytes| codex::account_id_from_auth(&bytes));
+            let limits = codex::read_limits(&dir, account_id.as_deref());
+            let (session, weekly, age) = match limits {
+                Limits::Snapshot(snapshot) => {
+                    let a = list_window(snapshot.session(), now, false);
+                    let b = list_window(snapshot.weekly(), now, true);
+                    saw_reset |= a.1 || b.1;
+                    (a.0, b.0, snapshot.age(now))
+                }
+                Limits::NoSnapshot => ("—".into(), "—".into(), "no data".into()),
+                Limits::AccountMismatch => ("—".into(), "—".into(), "mismatch".into()),
+                Limits::Unreadable => ("—".into(), "—".into(), "unreadable".into()),
+            };
+            (session, weekly, age, "—".into())
+        } else if p.tool != Tool::Claude {
             ("—".into(), "—".into(), "—".into(), "—".into())
         } else {
             saw_claude = true;
@@ -2562,8 +2589,8 @@ mod tests {
     }
 
     #[test]
-    fn mixed_list_has_tool_column_and_skips_codex_limits() {
-        // Known-bad: Codex list rows read Claude limits or exceed 120 columns with a 30-character email.
+    fn mixed_list_has_tool_column_and_no_codex_report() {
+        // Known-bad: a Codex row reads Claude limits or exceeds 120 columns with an invented long email.
         let tmp = TempDir::new().unwrap();
         let manager = mixed_tool_manager(&tmp);
         let output = list_output(&manager, Utc::now()).unwrap();
@@ -2595,7 +2622,7 @@ mod tests {
             "Auth:      —\n",
             "Gateway:   —\n",
             "Plan:      plus\n",
-            "Plan limits: —\n",
+            "Plan limits: no Codex session has reported one yet.\n",
         ] {
             assert!(codex.contains(expected), "{codex}");
         }
@@ -2610,6 +2637,80 @@ mod tests {
             manager.profile_dir("c").display()
         );
         assert_eq!(claude, expected);
+    }
+
+    #[test]
+    fn codex_list_and_info_show_reports_and_no_data() {
+        // Known-bad: changing Claude's wording while adding Codex's limit text.
+        let tmp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let mut registry = Registry::default();
+        for name in ["empty", "spare-gpt"] {
+            registry.profiles.insert(
+                name.into(),
+                Profile {
+                    name: name.into(),
+                    tool: Tool::Codex,
+                    email: Some(format!("{name}@example.com")),
+                    added: crate::codex_tests::at("2030-01-01T00:00:00Z"),
+                    last_used: None,
+                },
+            );
+            fs::create_dir_all(manager.profile_dir(name)).unwrap();
+        }
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        crate::codex_tests::session(
+            &manager.profile_dir("spare-gpt"),
+            1,
+            None,
+            &[crate::codex_tests::event(
+                "2030-01-01T01:00:00Z",
+                "codex",
+                crate::codex_tests::window(300, serde_json::json!(12), None),
+                crate::codex_tests::window(10_080, serde_json::json!(85), None),
+            )],
+            "2030-01-01T03:00:00Z",
+        );
+        let now = crate::codex_tests::at("2030-01-01T02:00:00Z");
+        let list = list_output(&manager, now).unwrap();
+        let rows = list.lines().collect::<Vec<_>>();
+        assert_eq!(
+            rows[2],
+            format!(
+                "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}",
+                "empty", "codex", "empty@example.com", "—", "—", "no data", "—", "never"
+            )
+        );
+        assert_eq!(
+            rows[3],
+            format!(
+                "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}",
+                "spare-gpt",
+                "codex",
+                "spare-gpt@example.com",
+                "12%",
+                "85% █████████░",
+                "1 h ago",
+                "—",
+                "never"
+            )
+        );
+        let info = info_output(&manager, "spare-gpt", now).unwrap();
+        assert!(info.contains(
+            "Plan limits (Codex's last report, 1 h ago):\n  Session (5h)   12%  █░░░░░░░░░  reset time unknown\n  Weekly (7d)    85%  █████████░  reset time unknown\n"
+        ), "{info}");
+        assert!(!info.contains("Usage (ledger"));
+        assert!(
+            info_output(&manager, "empty", now)
+                .unwrap()
+                .contains("Plan limits: no Codex session has reported one yet.\n")
+        );
     }
 
     #[test]

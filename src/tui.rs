@@ -12,6 +12,7 @@ use ratatui::{
     },
 };
 
+use crate::codex;
 use crate::gateway::{self, GatewayInput};
 use crate::key::{self, AuthMode, InputStep};
 use crate::limits::{Limits, Window, parse_limits, read_claude_json};
@@ -407,6 +408,14 @@ impl App {
                         self.manager
                             .codex_identity(name)
                             .and_then(|identity| identity.plan_type),
+                    );
+                    let dir = self.manager.profile_dir(name);
+                    let account_id = std::fs::read(dir.join("auth.json"))
+                        .ok()
+                        .and_then(|bytes| codex::account_id_from_auth(&bytes));
+                    self.limits.insert(
+                        name.clone(),
+                        codex::read_limits(&dir, account_id.as_deref()),
                     );
                 }
                 self.limits_selection = selected;
@@ -1753,7 +1762,7 @@ impl App {
             ]));
         }
         lines.push(Line::from(""));
-        if profile.tool != Tool::Claude {
+        if profile.tool != Tool::Claude && profile.tool != Tool::Codex {
             lines.push(Line::from("  Plan limits  —"));
         } else {
             match self.limits.get(&profile.name) {
@@ -1776,22 +1785,36 @@ impl App {
                     }
                 }
                 Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
-                    "  Plan limits  mismatch: another account's snapshot",
+                    if profile.tool == Tool::Codex {
+                        "  Plan limits  mismatch: another account's report"
+                    } else {
+                        "  Plan limits  mismatch: another account's snapshot"
+                    },
                     Style::default().fg(MUTED),
                 ))),
                 Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
-                    "  Plan limits  unreadable: file couldn't be read",
+                    if profile.tool == Tool::Codex {
+                        "  Plan limits  unreadable: session files couldn't be read"
+                    } else {
+                        "  Plan limits  unreadable: file couldn't be read"
+                    },
                     Style::default().fg(MUTED),
                 ))),
                 Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
-                    "  Plan limits  no data: no cached snapshot yet",
+                    if profile.tool == Tool::Codex {
+                        "  Plan limits  no data: no Codex report yet"
+                    } else {
+                        "  Plan limits  no data: no cached snapshot yet"
+                    },
                     Style::default().fg(MUTED),
                 ))),
             }
-            lines.push(Line::from(""));
-            for line in self.usage_panel_text(&profile.name).lines() {
-                for wrapped in wrap_usage_line(line, inner.width as usize) {
-                    lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+            if profile.tool == Tool::Claude {
+                lines.push(Line::from(""));
+                for line in self.usage_panel_text(&profile.name).lines() {
+                    for wrapped in wrap_usage_line(line, inner.width as usize) {
+                        lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+                    }
                 }
             }
         }
@@ -3769,8 +3792,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_detail_shows_tool_and_plan_without_claude_limits() {
-        // Known-bad: Codex details display Claude auth or limit data, or omit JWT plan type.
+    fn codex_detail_shows_tool_plan_and_no_report_state() {
+        // Known-bad: Codex details display Claude auth or cache wording, or omit JWT plan type.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
         let mut registry = app.manager.load_registry().unwrap();
@@ -3789,9 +3812,60 @@ mod tests {
         assert!(display.contains("Tool"));
         assert!(display.contains("codex"));
         assert!(display.contains("plus"));
-        assert!(display.contains("Plan limits  —"));
+        assert!(display.contains("Plan limits  no data: no Codex report yet"));
         assert!(display.contains("CODEX_HOME"));
         assert!(!display.contains("no data: no cached snapshot"));
+    }
+
+    #[test]
+    fn codex_detail_renders_snapshot_and_all_other_limit_states() {
+        // Known-bad: the selected Codex panel keeps printing "Plan limits  —".
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("spare-gpt", Some("spare-gpt@example.com"))]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("spare-gpt").unwrap().tool = Tool::Codex;
+        std::fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.profiles[0].tool = Tool::Codex;
+        crate::codex_tests::session(
+            &app.manager.profile_dir("spare-gpt"),
+            1,
+            None,
+            &[crate::codex_tests::event(
+                "2030-01-01T01:00:00Z",
+                "codex",
+                crate::codex_tests::window(300, serde_json::json!(12), None),
+                crate::codex_tests::window(10_080, serde_json::json!(85), None),
+            )],
+            "2030-01-01T03:00:00Z",
+        );
+        app.limits_now = crate::codex_tests::at("2030-01-01T02:00:00Z");
+        app.refresh_limits_if_due(Instant::now());
+        let display = render_text(&mut app);
+        assert!(display.contains("Plan limits  as of 1 h ago"), "{display}");
+        assert!(display.contains("Session (5h)"), "{display}");
+        assert!(display.contains("Weekly (7d)"), "{display}");
+        for (state, expected) in [
+            (
+                Limits::NoSnapshot,
+                "Plan limits  no data: no Codex report yet",
+            ),
+            (
+                Limits::AccountMismatch,
+                "Plan limits  mismatch: another account's report",
+            ),
+            (
+                Limits::Unreadable,
+                "Plan limits  unreadable: session files couldn't be read",
+            ),
+        ] {
+            app.limits.insert("spare-gpt".into(), state);
+            let display = render_text(&mut app);
+            assert!(display.contains(expected), "{display}");
+        }
     }
 
     #[test]

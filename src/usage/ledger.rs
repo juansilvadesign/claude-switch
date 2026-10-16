@@ -108,7 +108,7 @@ fn save_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
     atomic::write(path, &bytes)
 }
 
-fn transcript_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+pub(crate) fn transcript_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }

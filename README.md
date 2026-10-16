@@ -126,7 +126,7 @@ Run `cswitch login <name> --tool codex` or `cswitch add <name> --tool codex`, or
 
 Before login, cswitch copies only `config.toml`, `AGENTS.md`, `agents/`, `rules/` and `skills/` from `CODEX_HOME` (if set and non-empty) or `~/.codex`. It preserves links, but never copies `auth.json`, sessions, logs, sqlite state, secrets or daemon packages. The new login is verified by exit status; the status command's output is discarded because API-key mode can print part of a key. Account email and optional plan type are read offline from the new profile's `auth.json`.
 
-Codex profiles cannot be copied or refreshed from a Claude session. Claude API keys, gateways, skills sync, plan limits and `cswitch usage` apply only to Claude profiles. `cswitch list` shows a `TOOL` column, while `info` and TUI details show the tool and any Codex plan type.
+Codex profiles cannot be copied or refreshed from a Claude session. Claude API keys, gateways, skills sync and `cswitch usage` apply only to Claude profiles; a Codex profile's plan limits come from its own session files (see Plan limits). `cswitch list` shows a `TOOL` column, while `info` and TUI details show the tool and any Codex plan type.
 
 ## Antigravity profiles
 
@@ -140,6 +140,8 @@ Local entries exist only in the profile, and removing the profile deletes them. 
 
 `cswitch list`, `cswitch info <name>`, and the TUI details panel show the 5-hour and 7-day plan limits from Claude Code's own cached snapshot. Each view shows when Claude Code fetched it, and marks a window as `reset` once its reset time has passed. A new profile may show `no data` until Claude Code writes a snapshot. `cswitch` reads the profile's cache without changing it, makes no network call, and never refreshes OAuth tokens.
 
+A Codex profile shows the same two windows from the last rate-limit report in its own session files (`sessions/` under its `CODEX_HOME`), with that report's age. A window is matched by its length, five hours or seven days, not by its place in the report. A report written while another ChatGPT account was signed in to that home is hidden. A new Codex profile shows `no data` until one of its sessions has sent a request.
+
 ## Status line
 
 `cswitch statusline` prints one line for Claude Code's status row. These layout examples use invented values:
@@ -150,7 +152,7 @@ work · acme › site · 5h 88% ↻20m · 7d 64% ↻Fri · → spare 5h 10% · c
 work · site · 5h 42% · 7d 71%
 ```
 
-The first fields identify the account and project; an internal `(unattributed)` workspace is omitted. `5h` and `7d` use Claude Code's live plan utilization and local reset time. If stdin has no limits, a subscription profile uses its saved snapshot (`~/.claude.json` for `default`), and figures older than five minutes show their age. A per-token profile has no saved-limit fallback. `→` shows the registered subscription account with the most 5-hour headroom when the current account reaches 80% on either limit. It never points to an account whose active 5-hour or weekly window rounds to 100% or more. Its saved figure also shows its age. `ctx` is the latest context size.
+The first fields identify the account and project; an internal `(unattributed)` workspace is omitted. `5h` and `7d` use Claude Code's live plan utilization and local reset time. If stdin has no limits, a subscription profile uses its saved snapshot (`~/.claude.json` for `default`), and figures older than five minutes show their age. A per-token profile has no saved-limit fallback. `→` shows the registered subscription account with the most 5-hour headroom when the current account reaches 80% on either limit. It never points to an account whose active 5-hour or weekly window rounds to 100% or more. When no other Claude account qualifies, it can point to a Codex account instead, named with its tool: `→ codex spare-gpt 5h 12%`, or `→ codex default 5h 12%` for the plain `~/.codex`. Its saved figure also shows its age. `ctx` is the latest context size.
 
 `chat ~$` is Claude Code's running estimate on a subscription profile, and `today ~$` is today's ledger list value plus this chat's unrecorded live cost. On a per-token profile, `chat $` and `today $` are priced from the ledger and the configured rate, without `~`. `today —` means there is no priced request for today yet, and a trailing `*` means some requests have no rate. A stale `today` value shows its age. A config directory that is neither a registered Claude profile nor the default shows no ledger figure; its `chat` still uses Claude Code's live estimate. On a narrow terminal, the line drops ages, `today`, `chat`, reset times and `ctx`, shortens the project, then drops headroom and limits as needed; it never wraps. Set `NO_COLOR` to a non-empty value to disable yellow and red limit highlighting.
 
