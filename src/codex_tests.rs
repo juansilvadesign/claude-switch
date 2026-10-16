@@ -1,5 +1,6 @@
 use crate::codex::{read_limits, read_stats, reset_read_stats};
 use crate::limits::{LimitSource, Limits, Snapshot, format_info};
+use crate::profile::{Profile, ProfileManager, Registry, Tool};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
@@ -289,6 +290,51 @@ fn codex_account_match_needs_both_ids() {
         read_limits(temp.path(), Some(ACCOUNT)),
         Limits::Snapshot(_)
     ));
+
+    let manager =
+        ProfileManager::with_paths(temp.path().join("switch"), temp.path().join(".claude"))
+            .unwrap();
+    let profile_dir = manager.profile_dir("spare-gpt");
+    fs::create_dir_all(&profile_dir).unwrap();
+    let mut registry = Registry::default();
+    registry.profiles.insert(
+        "spare-gpt".into(),
+        Profile {
+            name: "spare-gpt".into(),
+            tool: Tool::Codex,
+            email: Some("spare-gpt@example.com".into()),
+            added: at("2030-01-01T00:00:00Z"),
+            last_used: None,
+        },
+    );
+    fs::write(
+        manager.base_dir.join("registry.json"),
+        serde_json::to_vec(&registry).unwrap(),
+    )
+    .unwrap();
+    let payload = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn19";
+    fs::write(
+        profile_dir.join("auth.json"),
+        format!(r#"{{"tokens":{{"id_token":"h.{payload}.s"}}}}"#),
+    )
+    .unwrap();
+    session(
+        &profile_dir,
+        1,
+        Some(OTHER),
+        &[event(
+            "2030-01-01T01:00:00Z",
+            "codex",
+            window(300, json!(42), None),
+            Value::Null,
+        )],
+        "2030-01-01T02:00:00Z",
+    );
+    let info = crate::info_output(&manager, "spare-gpt", at("2030-01-01T01:30:00Z")).unwrap();
+    assert!(
+        info.contains("Plan limits: the last report belongs to another account, so it's hidden.")
+    );
+    assert!(!info.contains("42%") && !info.contains(ACCOUNT) && !info.contains(OTHER));
 }
 
 #[test]
