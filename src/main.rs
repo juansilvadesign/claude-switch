@@ -2711,6 +2711,52 @@ mod tests {
                 .unwrap()
                 .contains("Plan limits: no Codex session has reported one yet.\n")
         );
+
+        let claude_tmp = TempDir::new().unwrap();
+        let claude_manager = ProfileManager::with_paths(
+            claude_tmp.path().join("switch"),
+            claude_tmp.path().join(".claude"),
+        )
+        .unwrap();
+        let mut claude_registry = Registry::default();
+        claude_registry.profiles.insert(
+            "work".into(),
+            Profile {
+                name: "work".into(),
+                tool: Tool::Claude,
+                email: Some("work@example.com".into()),
+                added: crate::codex_tests::at("2030-01-01T00:00:00Z"),
+                last_used: None,
+            },
+        );
+        fs::create_dir_all(claude_manager.profile_dir("work")).unwrap();
+        fs::write(
+            claude_manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&claude_registry).unwrap(),
+        )
+        .unwrap();
+        let header = format!(
+            "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}",
+            "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "30D $", "LAST USED"
+        );
+        let row = format!(
+            "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}",
+            "work", "claude", "work@example.com", "—", "—", "unreadable", "—", "never"
+        );
+        assert_eq!(
+            list_output(&claude_manager, now).unwrap(),
+            format!(
+                "{header}\n{}\n{row}\n\nno ledger yet — run `cswitch usage`\n",
+                "─".repeat(120)
+            )
+        );
+        assert_eq!(
+            info_output(&claude_manager, "work", now).unwrap(),
+            format!(
+                "Name:      work\nTool:      claude\nEmail:     work@example.com\nAuth:      not logged in\nGateway:   the Anthropic API\nPlan limits: the file couldn't be read.\nUsage:     no ledger yet — run `cswitch usage`\nAdded:     2030-01-01 00:00 UTC\nLast used: never\nDirectory: {}\n\nLaunch:\n  cswitch use work\n",
+                claude_manager.profile_dir("work").display()
+            )
+        );
     }
 
     #[test]

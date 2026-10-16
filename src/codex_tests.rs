@@ -298,8 +298,6 @@ fn codex_bad_lines_do_not_break_the_read() {
     let path = session(temp.path(), 1, None, &[], "2030-01-01T02:00:00Z");
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
     writeln!(file, "{}", "x".repeat(2 * 1024 * 1024)).unwrap();
-    writeln!(file, "not-json").unwrap();
-    writeln!(file, "{}", json!({"timestamp":"2030-01-01T00:30:00Z", "type":"event_msg", "payload":{"type":"token_count", "rate_limits":null}})).unwrap();
     writeln!(
         file,
         "{}",
@@ -311,6 +309,8 @@ fn codex_bad_lines_do_not_break_the_read() {
         )
     )
     .unwrap();
+    writeln!(file, "{}", json!({"timestamp":"2030-01-01T00:30:00Z", "type":"event_msg", "payload":{"type":"token_count", "rate_limits":null}})).unwrap();
+    writeln!(file, "not-json").unwrap();
     write!(file, "{{\"timestamp\":").unwrap();
     drop(file);
     modified(&path, "2030-01-01T02:00:00Z");
