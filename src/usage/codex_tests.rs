@@ -733,11 +733,11 @@ fn claude_only_ledger_and_reports_match_claude_source_path() {
     modern.ingest().unwrap();
     legacy.ingest().unwrap();
     let normalize = |path: &Path| {
-        let mut value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        if let Some(object) = value.as_object_mut() {
-            object.remove("generated_at");
-        }
-        value
+        fs::read_to_string(path)
+            .unwrap()
+            .split_inclusive('\n')
+            .filter(|line| !line.trim_start().starts_with("\"generated_at\":"))
+            .collect::<String>()
     };
     for name in ["hourly.json", "chats.json", "summary.json", "cursors.json"] {
         assert_eq!(
@@ -761,6 +761,39 @@ fn claude_only_ledger_and_reports_match_claude_source_path() {
         modern_report,
         super::report::run(&legacy, &options, now).unwrap()
     );
+    for by in ["profile", "workspace", "project", "session", "model", "day"] {
+        let options = super::report::Options {
+            since: "all".into(),
+            profile: None,
+            by: Some(by.into()),
+            json: false,
+            explain: None,
+            unattributed: false,
+        };
+        assert_eq!(
+            super::report::run(&modern, &options, now).unwrap(),
+            super::report::run(&legacy, &options, now).unwrap(),
+            "--by {by}"
+        );
+    }
+    for (json, explain, unattributed) in [
+        (true, None, false),
+        (false, Some("claude-session"), false),
+        (false, None, true),
+    ] {
+        let options = super::report::Options {
+            since: "all".into(),
+            profile: None,
+            by: None,
+            json,
+            explain: explain.map(str::to_string),
+            unattributed,
+        };
+        assert_eq!(
+            super::report::run(&modern, &options, now).unwrap(),
+            super::report::run(&legacy, &options, now).unwrap()
+        );
+    }
     assert_eq!(
         super::report::verify(&modern).unwrap(),
         super::report::verify(&legacy).unwrap()
