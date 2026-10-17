@@ -1702,7 +1702,7 @@ impl ProfileManager {
     }
 }
 
-fn safe_shell_name(name: &str) -> bool {
+pub(crate) fn safe_shell_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()

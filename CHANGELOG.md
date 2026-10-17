@@ -20,6 +20,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
+- **Antigravity quota and status line.** A profile's Gemini 5-hour and weekly bars come from the quota payload saved by its cswitch status line, with age, resets and the other two buckets in detail. Install it with `cswitch agy-statusline --install <name>`; an explicit `info --refresh-quota` or TUI `Q` requests a live check. Antigravity usage details are tokens only and `30D $` stays `—`. The Claude status line's `→` searches Claude, then Codex, then Antigravity accounts.
 - **Codex usage in the ledger.** `cswitch usage` reads each Codex home's session files, the plain `~/.codex` included, and prices them at OpenAI's list prices. `list`, `info` and the TUI show a Codex profile's `30D $` and its today, 7-day and 30-day figures. The seed adds `gpt-6-sol` and `gpt-6-astra`.
 - **Codex plan limits.** `list`, `info` and the TUI show a Codex profile's 5-hour and weekly limits from the last rate-limit report in its own session files, offline. When no other Claude account has room, the status line's `→` can name a Codex account, the plain `~/.codex` included.
 - **List-price cards by prompt length.** Requests can select a second card when input tokens, including cache writes and reads, exceed a model's threshold. The seed now includes Claude Haiku 5.5, Sonnet 5.5 and Fable 5.1.

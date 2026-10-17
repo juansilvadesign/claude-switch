@@ -1,4 +1,6 @@
 mod agy;
+mod agy_limits;
+mod agy_statusline;
 mod atomic;
 mod codex;
 #[cfg(test)]
@@ -115,6 +117,104 @@ mod codex_usage_view_tests {
         let row = list_output(&manager, now).unwrap();
         let row = row.lines().find(|line| line.starts_with("spare ")).unwrap();
         assert!(row.contains("~$0.60") && !row.contains('*'), "{row}");
+    }
+}
+
+#[cfg(test)]
+mod agy_quota_view_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn antigravity_list_and_info_show_gemini_bars_details_and_tokens_without_dollars() {
+        // Known-bad: 3p takes the headline bars, or an Antigravity dollar cell is printed.
+        let temp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(temp.path().join("switch"), temp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 1, 12, 0, 0).unwrap();
+        let mut registry = profile::Registry::default();
+        registry.profiles.insert(
+            "spare".into(),
+            profile::Profile {
+                name: "spare".into(),
+                tool: Tool::Antigravity,
+                email: Some("spare@example.com".into()),
+                added: now,
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let quota = json!({
+            "gemini-5h":{"remaining_fraction":0.88,"reset_time":"2030-01-01T15:00:00Z"},
+            "gemini-weekly":{"remaining_fraction":0.65,"reset_time":"2030-01-07T12:00:00Z"},
+            "3p-5h":{"remaining_fraction":0.99,"reset_time":"2030-01-01T16:00:00Z"},
+            "3p-weekly":{"remaining_fraction":0.98,"reset_time":"2030-01-08T12:00:00Z"}
+        });
+        agy_limits::save(
+            &manager.base_dir,
+            "spare",
+            &quota,
+            Some("Google AI Pro"),
+            now,
+        )
+        .unwrap();
+        let usage_dir = usage_directory(&manager);
+        fs::create_dir_all(&usage_dir).unwrap();
+        let hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: now,
+            rows: vec![usage::metrics::Bucket {
+                profile: "spare".into(),
+                hour: now - chrono::Duration::hours(1),
+                model: "(unknown)".into(),
+                speed: None,
+                prompt_tier: None,
+                requests: 1,
+                input: 100,
+                output: 10,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 20,
+            }],
+        };
+        fs::write(
+            usage_dir.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let list = list_output(&manager, now).unwrap();
+        let row = list
+            .lines()
+            .find(|line| line.starts_with("spare "))
+            .unwrap();
+        assert!(row.contains("12%") && row.contains("35%"), "{row}");
+        assert!(!row.contains(" 1%") && !row.contains(" 2%"), "{row}");
+        assert_eq!(row.split_whitespace().nth_back(1), Some("—"), "{row}");
+        let info = info_output(&manager, "spare", now).unwrap();
+        assert!(info.contains("Plan:      Google AI Pro"), "{info}");
+        assert!(
+            info.contains("Session (5h)   12%") && info.contains("Weekly (7d)    35%"),
+            "{info}"
+        );
+        assert!(
+            info.contains("3p 5h") && info.contains("3p weekly"),
+            "{info}"
+        );
+        assert!(
+            info.contains("Today          130 tok")
+                && info.contains("7 days         130 tok")
+                && info.contains("30 days        130 tok"),
+            "{info}"
+        );
+        assert!(!info.contains('$'), "{info}");
     }
 }
 
@@ -236,6 +336,9 @@ enum Commands {
     Info {
         /// Profile name
         name: String,
+        /// Ask Antigravity for fresh quota (network call; saved quota survives failure)
+        #[arg(long)]
+        refresh_quota: bool,
     },
 
     /// Print shell aliases for all profiles
@@ -287,6 +390,25 @@ enum Commands {
         /// Render without a background ledger refresh
         #[arg(long, conflicts_with = "uninstall")]
         no_refresh: bool,
+    },
+
+    /// Render or install the quota-saving Antigravity status line
+    AgyStatusline {
+        /// Install in the named Antigravity profile
+        #[arg(long, conflicts_with_all = ["uninstall", "profile"])]
+        install: Option<String>,
+        /// Remove a cswitch-owned line from the named profile
+        #[arg(long, conflicts_with_all = ["install", "profile"])]
+        uninstall: Option<String>,
+        /// Account key for Antigravity's stdin invocation
+        #[arg(long, requires = "store")]
+        profile: Option<String>,
+        /// Absolute cswitch store, passed by the installed command
+        #[arg(long, requires = "profile")]
+        store: Option<std::path::PathBuf>,
+        /// Replace another command's line
+        #[arg(long, requires = "install")]
+        force: bool,
     },
 }
 
@@ -421,6 +543,19 @@ fn ask_save_defaults(base_dir: &Path, input: &gateway::GatewayInput) -> Result<b
 
 fn main() -> Result<()> {
     let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    if let Some(Commands::AgyStatusline {
+        profile: Some(account),
+        store: Some(base),
+        ..
+    }) = &cli.command
+    {
+        std::panic::set_hook(Box::new(|_| {}));
+        let line =
+            std::panic::catch_unwind(|| agy_statusline::command_line(base, account, Utc::now()))
+                .unwrap_or_else(|_| "agy".into());
+        println!("{line}");
+        return Ok(());
+    }
     if let Some(Commands::Statusline {
         install: false,
         uninstall: false,
@@ -487,6 +622,47 @@ fn main() -> Result<()> {
             eprintln!("{phrase}");
             std::process::exit(code);
         }
+        return Ok(());
+    }
+    if let Some(Commands::AgyStatusline {
+        install,
+        uninstall,
+        force,
+        ..
+    }) = &cli.command
+    {
+        let name = install
+            .as_deref()
+            .or(uninstall.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("Pass --install NAME or --uninstall NAME"))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let manager = ProfileManager::with_paths_read_only(
+            home.join(".claude-switch"),
+            home.join(".claude"),
+        )?;
+        let changed = agy_statusline::manage(
+            &manager,
+            name,
+            install.is_some(),
+            *force,
+            &std::env::current_exe()?,
+            Utc::now(),
+        )?;
+        println!(
+            "{name}: {}",
+            if install.is_some() {
+                if changed {
+                    "installed"
+                } else {
+                    "already installed"
+                }
+            } else if changed {
+                "removed"
+            } else {
+                "nothing to remove"
+            }
+        );
         return Ok(());
     }
     let manager = ProfileManager::new()?;
@@ -654,7 +830,17 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Info { name }) => print!("{}", info_output(&manager, &name, Utc::now())?),
+        Some(Commands::Info {
+            name,
+            refresh_quota,
+        }) => {
+            if refresh_quota
+                && let Err(error) = agy_statusline::refresh_for_profile(&manager, &name, Utc::now())
+            {
+                eprintln!("{error}");
+            }
+            print!("{}", info_output(&manager, &name, Utc::now())?);
+        }
 
         Some(Commands::Aliases) => {
             println!("{}", manager.generate_aliases()?);
@@ -827,6 +1013,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Statusline { .. }) => unreachable!("handled before manager setup"),
+        Some(Commands::AgyStatusline { .. }) => unreachable!("handled before manager setup"),
     }
 
     Ok(())
@@ -1202,6 +1389,17 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                 "Home:      {}\n",
                 agy::profile_home(&dir).display()
             ));
+            let tier = agy_limits::plan_tier(&manager.base_dir, &profile.name, now)
+                .unwrap_or_else(|| "—".into());
+            output.push_str(&format!("Plan:      {tier}\n"));
+            let limits = agy_limits::read_limits(&manager.base_dir, &profile.name, now);
+            output.push_str(&format_info(&limits, now, LimitSource::Antigravity));
+            output.push_str(&usage_tokens_info(
+                usage::metrics::read(&usage_directory(manager)).as_ref(),
+                &profile.name,
+                now,
+                Local::now().offset().fix(),
+            ));
             match manager.agy_farm_health(name) {
                 Ok(health) => {
                     output.push_str(&format!(
@@ -1219,7 +1417,7 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                 Err(_) => output.push_str("Farm:      unavailable\nLocal:     —\n"),
             }
         }
-        if profile.tool != Tool::Codex {
+        if profile.tool != Tool::Codex && profile.tool != Tool::Antigravity {
             output.push_str("Plan limits: —\n");
         }
     }
@@ -1472,6 +1670,35 @@ fn usage_30d_cell(
     }
 }
 
+fn usage_tokens_info(
+    hourly: Option<&usage::metrics::Hourly>,
+    name: &str,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> String {
+    use usage::metrics as m;
+    let Some(hourly) = hourly else {
+        return "Usage:     no ledger yet — run `cswitch usage`\n".into();
+    };
+    let age = profile::describe_age((now - hourly.generated_at).num_seconds().max(0) as u64);
+    let starts = [
+        m::start_today(now, offset),
+        m::floor_hour(now - chrono::Duration::days(7)),
+        m::floor_hour(now - chrono::Duration::days(30)),
+    ];
+    let mut output = format!("Usage (ledger as of {age}; tokens only):\n");
+    for (label, start) in ["Today", "7 days", "30 days"].into_iter().zip(starts) {
+        let tokens: u64 = hourly
+            .rows
+            .iter()
+            .filter(|row| row.profile == name && row.hour >= start && row.hour < now)
+            .map(|row| row.tokens().iter().sum::<u64>())
+            .sum();
+        output.push_str(&format!("  {label:<9} {:>8} tok\n", m::tokens(tokens)));
+    }
+    output
+}
+
 fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
     use usage::metrics as m;
     let profiles = manager.list_profiles()?;
@@ -1531,6 +1758,21 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             );
             saw_usage |= cell != "—";
             (session, weekly, age, cell)
+        } else if p.tool == Tool::Antigravity {
+            saw_claude = true;
+            let limits = agy_limits::read_limits(&manager.base_dir, &p.name, now);
+            let (session, weekly, age) = match limits {
+                Limits::Snapshot(snapshot) => {
+                    let a = list_window(snapshot.session(), now, false);
+                    let b = list_window(snapshot.weekly(), now, true);
+                    saw_reset |= a.1 || b.1;
+                    (a.0, b.0, snapshot.age(now))
+                }
+                Limits::NoSnapshot => ("—".into(), "—".into(), "no data".into()),
+                Limits::AccountMismatch => ("—".into(), "—".into(), "mismatch".into()),
+                Limits::Unreadable => ("—".into(), "—".into(), "unreadable".into()),
+            };
+            (session, weekly, age, "—".into())
         } else if p.tool != Tool::Claude {
             ("—".into(), "—".into(), "—".into(), "—".into())
         } else {
@@ -2647,7 +2889,8 @@ mod tests {
         let row = output.lines().find(|line| line.starts_with("g ")).unwrap();
         let cells: Vec<_> = row.split_whitespace().collect();
         assert_eq!(cells[1], "antigravity");
-        assert_eq!(&cells[3..7], &["—", "—", "—", "—"]);
+        assert_eq!(&cells[3..7], &["—", "—", "no", "data"]);
+        assert_eq!(cells[7], "—");
     }
 
     fn mixed_tool_manager(tmp: &TempDir) -> ProfileManager {

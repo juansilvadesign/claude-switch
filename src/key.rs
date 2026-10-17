@@ -71,6 +71,55 @@ mod statusline_tests {
     }
 
     #[test]
+    fn antigravity_install_and_uninstall_edit_only_statusline_with_backup() {
+        // Known-bad: clobbering sibling settings, skipping the backup, or accepting a foreign line.
+        let (_temp, manager) = setup();
+        register(&manager, "spare", Tool::Antigravity);
+        let path = crate::agy::profile_home(&manager.profile_dir("spare"))
+            .join(".gemini/antigravity-cli/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = br#"{"theme":"dark","statusLine":{"type":"","command":"","enabled":true},"permissions":{"allow":["Read"]}}"#;
+        fs::write(&path, original).unwrap();
+        let executable = Path::new("/synthetic/cswitch");
+        let command = format!(
+            "/synthetic/cswitch agy-statusline --profile spare --store {}",
+            manager.base_dir.display()
+        );
+        assert!(
+            edit_agy_statusline(&manager, "spare", Some(&command), false, executable, now())
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read(&backup_files(&manager, "spare")[0]).unwrap(),
+            original
+        );
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed["theme"], "dark");
+        assert_eq!(installed["permissions"]["allow"][0], "Read");
+        assert_eq!(
+            installed["statusLine"],
+            json!({"type":"command","command":command,"enabled":true})
+        );
+        assert!(
+            !edit_agy_statusline(&manager, "spare", Some(&command), false, executable, now())
+                .unwrap()
+        );
+        assert_eq!(backup_files(&manager, "spare").len(), 1);
+        assert!(edit_agy_statusline(&manager, "spare", None, false, executable, now()).unwrap());
+        let removed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(removed.get("statusLine").is_none());
+        assert_eq!(removed["theme"], "dark");
+        assert_eq!(removed["permissions"], installed["permissions"]);
+        assert_eq!(backup_files(&manager, "spare").len(), 2);
+        fs::write(
+            &path,
+            br#"{"statusLine":{"type":"command","command":"other"}}"#,
+        )
+        .unwrap();
+        assert!(edit_agy_statusline(&manager, "spare", None, false, executable, now()).is_err());
+    }
+
+    #[test]
     fn statusline_ownership_requires_exact_shell_words() {
         // Known-bad: `contains("statusline")` accepts a foreign shell command.
         for command in [
@@ -967,6 +1016,64 @@ pub fn edit_statusline(
     Ok(edit_settings(&path, &manager.base_dir, name, edit, now, |_| {})?.changed)
 }
 
+fn owns_agy_statusline(value: &Value, executable: &Path, account: &str, base: &Path) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("command") {
+        return false;
+    }
+    let Some(words) = value
+        .get("command")
+        .and_then(Value::as_str)
+        .and_then(shell_words)
+    else {
+        return false;
+    };
+    words.len() == 6
+        && (words[0] == executable.to_string_lossy()
+            || matches!(
+                Path::new(&words[0])
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some("cswitch" | "cswitch.exe")
+            ))
+        && words[1] == "agy-statusline"
+        && words[2] == "--profile"
+        && words[3] == account
+        && words[4] == "--store"
+        && fs::canonicalize(&words[5])
+            .is_ok_and(|resolved| fs::canonicalize(base).is_ok_and(|expected| expected == resolved))
+}
+
+/// Edit only the Antigravity statusLine key, using the same backed-up editor as Claude.
+pub fn edit_agy_statusline(
+    manager: &ProfileManager,
+    name: &str,
+    command: Option<&str>,
+    force: bool,
+    executable: &Path,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if manager.get_profile(name)?.tool != Tool::Antigravity {
+        bail!("Antigravity status lines require an Antigravity profile");
+    }
+    let path = crate::agy::profile_home(&manager.profile_dir(name))
+        .join(".gemini/antigravity-cli/settings.json");
+    let edit = match command {
+        Some(command) => Edit::AgyStatuslineInstall {
+            command,
+            force,
+            executable,
+            account: name,
+            base: &manager.base_dir,
+        },
+        None => Edit::AgyStatuslineUninstall {
+            executable,
+            account: name,
+            base: &manager.base_dir,
+        },
+    };
+    Ok(edit_settings(&path, &manager.base_dir, name, edit, now, |_| {})?.changed)
+}
+
 #[derive(Clone, Copy)]
 struct Stamp {
     len: u64,
@@ -1053,6 +1160,18 @@ enum Edit<'a> {
     StatuslineUninstall {
         executable: Option<&'a Path>,
     },
+    AgyStatuslineInstall {
+        command: &'a str,
+        force: bool,
+        executable: &'a Path,
+        account: &'a str,
+        base: &'a Path,
+    },
+    AgyStatuslineUninstall {
+        executable: &'a Path,
+        account: &'a str,
+        base: &'a Path,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1080,6 +1199,59 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
     let foreign = present;
     let managed = current.and_then(managed_helper_name);
     match edit {
+        Edit::AgyStatuslineInstall {
+            command,
+            force,
+            executable,
+            account,
+            base,
+        } => {
+            let current = object.get("statusLine");
+            let vacant = current.is_some_and(|value| {
+                value.get("type").and_then(Value::as_str) == Some("")
+                    && value.get("command").and_then(Value::as_str) == Some("")
+            });
+            if current.is_some_and(|value| {
+                !vacant && !owns_agy_statusline(value, executable, account, base)
+            }) && !force
+            {
+                bail!("{name} already has a status line; pass --force to replace it");
+            }
+            let next = serde_json::json!({
+                "type":"command", "command":command, "enabled":true
+            });
+            let changed = current != Some(&next);
+            if changed {
+                object.insert("statusLine".into(), next);
+            }
+            Ok(Merge {
+                json,
+                changed,
+                foreign_helper: false,
+                overwritten: Vec::new(),
+                removed_gateway_count: 0,
+            })
+        }
+        Edit::AgyStatuslineUninstall {
+            executable,
+            account,
+            base,
+        } => {
+            let current = object.get("statusLine");
+            if let Some(current) = current
+                && !owns_agy_statusline(current, executable, account, base)
+            {
+                bail!("{name} has a foreign status line; nothing was removed");
+            }
+            let changed = object.remove("statusLine").is_some();
+            Ok(Merge {
+                json,
+                changed,
+                foreign_helper: false,
+                overwritten: Vec::new(),
+                removed_gateway_count: 0,
+            })
+        }
         Edit::StatuslineInstall {
             command,
             force,

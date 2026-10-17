@@ -1,5 +1,14 @@
 # claude-switch Fork — Build Task Tracker
 
+## Antigravity quota and status line — 2026-10-17
+
+- [x] Save four Antigravity quota buckets offline under the explicit account key; show Gemini bars, age and reset state in list, info and the TUI.
+- [x] Render a bounded in-Antigravity cswitch status line, with backed-up install and uninstall edits to the profile settings.
+- [x] Add an on-request live quota refresh to `info` and the TUI; keep saved quota on failure.
+- [x] Extend the `→` hint from Claude to Codex to Antigravity, including the plain Antigravity home.
+- [x] Show Antigravity ledger totals as tokens only when present, with no dollar cell.
+- [x] Cover quota parsing, offline persistence, views, install and the isolated HOME with synthetic tests.
+
 ## Codex limits and usage — 2026-10-14
 
 - [x] Read Codex session tails offline for plan windows, age and account matching.

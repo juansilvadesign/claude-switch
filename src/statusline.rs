@@ -1,5 +1,6 @@
 //! Claude Code's one-line, read-only status display.
 
+use crate::agy_limits;
 use crate::codex;
 use crate::key;
 use crate::limits::{self, Limits, Snapshot, read_claude_json_once};
@@ -357,6 +358,21 @@ pub fn read_disk(
                                 .then_with(|| a.name.cmp(&b.name))
                         })
                 })
+                .or_else(|| {
+                    std::iter::once(("default", agy_limits::DEFAULT_ACCOUNT))
+                        .chain(
+                            profiles
+                                .iter()
+                                .filter(|profile| profile.tool == Tool::Antigravity)
+                                .map(|profile| (profile.name.as_str(), profile.name.as_str())),
+                        )
+                        .filter_map(|(name, key)| agy_candidate(name, key, &manager.base_dir, now))
+                        .min_by(|a, b| {
+                            a.five_percent
+                                .total_cmp(&b.five_percent)
+                                .then_with(|| a.name.cmp(&b.name))
+                        })
+                })
         })
     } else {
         None
@@ -475,6 +491,35 @@ fn codex_candidate(name: &str, dir: &Path, now: DateTime<Utc>) -> Option<Headroo
         .map(|window| window.percent);
     Some(Headroom {
         tool: Tool::Codex,
+        name: clean(name),
+        five_percent: if five_reset { 0.0 } else { five.percent },
+        five_reset,
+        weekly_percent,
+        fetched_at: snapshot.fetched_at,
+    })
+}
+
+fn agy_candidate(name: &str, account: &str, base: &Path, now: DateTime<Utc>) -> Option<Headroom> {
+    let Limits::Snapshot(snapshot) = agy_limits::read_limits(base, account, now) else {
+        return None;
+    };
+    let five = snapshot.session()?;
+    let five_reset = five.rolled_over(now);
+    if !five_reset && five.percent.round() >= 100.0 {
+        return None;
+    }
+    if snapshot
+        .weekly()
+        .is_some_and(|window| !window.rolled_over(now) && window.percent.round() >= 100.0)
+    {
+        return None;
+    }
+    let weekly_percent = snapshot
+        .weekly()
+        .filter(|window| !window.rolled_over(now) && window.percent >= 80.0)
+        .map(|window| window.percent);
+    Some(Headroom {
+        tool: Tool::Antigravity,
         name: clean(name),
         five_percent: if five_reset { 0.0 } else { five.percent },
         five_reset,
@@ -859,6 +904,8 @@ pub fn render(
             "→ {}{} 5h {}",
             if candidate.tool == Tool::Codex {
                 "codex "
+            } else if candidate.tool == Tool::Antigravity {
+                "agy "
             } else {
                 ""
             },
@@ -1426,6 +1473,88 @@ mod tests {
             false,
         );
         assert!(output.contains("→ codex alpha 5h 3%"), "{output}");
+    }
+
+    #[test]
+    fn antigravity_hint_follows_claude_then_codex_and_uses_gemini_headroom() {
+        // Known-bad: offering agy before Codex, dropping its tool word, or offering a full Gemini window.
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        register(
+            home,
+            &[
+                ("work", Tool::Claude),
+                ("spare", Tool::Claude),
+                ("spare-gpt", Tool::Codex),
+                ("alpha", Tool::Antigravity),
+                ("beta", Tool::Antigravity),
+            ],
+        );
+        let base = home.join(".claude-switch");
+        let work = base.join("profiles/work");
+        let spare = base.join("profiles/spare");
+        let codex_home = base.join("profiles/spare-gpt");
+        let usage = home.join("usage");
+        let input = json!({"rate_limits":{"five_hour":{"used_percentage":90}}});
+        fs::write(
+            spare.join(".claude.json"),
+            serde_json::to_vec(&snapshot(
+                40.0,
+                now().timestamp() + 3600,
+                20.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::codex_tests::session(
+            &codex_home,
+            1,
+            None,
+            &[crate::codex_tests::event(
+                "2030-01-01T10:00:00Z",
+                "codex",
+                crate::codex_tests::window(300, json!(3), Some(now().timestamp() + 3600)),
+                Value::Null,
+            )],
+            "2030-01-01T13:00:00Z",
+        );
+        let quota = |gemini: f64, weekly: f64| {
+            json!({
+                "gemini-5h":{"remaining_fraction":gemini,"reset_time":"2030-01-01T15:00:00Z"},
+                "gemini-weekly":{"remaining_fraction":weekly,"reset_time":"2030-01-07T12:00:00Z"},
+                "3p-5h":{"remaining_fraction":0.01,"reset_time":"2030-01-01T16:00:00Z"},
+                "3p-weekly":{"remaining_fraction":0.01,"reset_time":"2030-01-08T12:00:00Z"}
+            })
+        };
+        crate::agy_limits::save(&base, "alpha", &quota(0.88, 0.65), None, now()).unwrap();
+        crate::agy_limits::save(&base, "beta", &quota(0.80, 0.65), None, now()).unwrap();
+        let render_hint = || {
+            line(
+                &input,
+                &read_disk(&input, home, Some(&work), &usage),
+                200,
+                false,
+            )
+        };
+        assert!(render_hint().contains("→ spare 5h 40%"));
+        fs::remove_file(spare.join(".claude.json")).unwrap();
+        assert!(render_hint().contains("→ codex spare-gpt 5h 3%"));
+        fs::remove_dir_all(codex_home.join("sessions")).unwrap();
+        assert!(render_hint().contains("→ agy alpha 5h 12%"));
+        crate::agy_limits::save(&base, "alpha", &quota(0.0, 0.65), None, now()).unwrap();
+        assert!(render_hint().contains("→ agy beta 5h 20%"));
+        crate::agy_limits::save(&base, "beta", &quota(0.80, 0.0), None, now()).unwrap();
+        assert!(!render_hint().contains('→'));
+        crate::agy_limits::save(
+            &base,
+            crate::agy_limits::DEFAULT_ACCOUNT,
+            &quota(0.97, 0.65),
+            None,
+            now(),
+        )
+        .unwrap();
+        assert!(render_hint().contains("→ agy default 5h 3%"));
     }
 
     #[test]

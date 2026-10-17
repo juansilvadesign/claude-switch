@@ -20,6 +20,7 @@ use crate::profile::{
     LoginMethod, LoginOutcome, Profile, ProfileManager, Tool, describe_age, detect_current_account,
 };
 use crate::usage::{self, metrics as m};
+use crate::{agy_limits, agy_statusline};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -118,6 +119,7 @@ pub struct App {
     limits: HashMap<String, Limits>,
     auth_modes: HashMap<String, AuthMode>,
     codex_plans: HashMap<String, Option<String>>,
+    agy_plans: HashMap<String, Option<String>>,
     limits_selection: Option<String>,
     last_limits_refresh: Option<Instant>,
     limits_now: DateTime<Utc>,
@@ -270,6 +272,16 @@ impl App {
         } else {
             (Mode::Normal, None, false, String::new())
         };
+        let limits = profiles
+            .iter()
+            .filter(|profile| profile.tool == Tool::Antigravity)
+            .map(|profile| {
+                (
+                    profile.name.clone(),
+                    agy_limits::read_limits(&manager.base_dir, &profile.name, Utc::now()),
+                )
+            })
+            .collect();
 
         Ok(Self {
             manager,
@@ -293,9 +305,10 @@ impl App {
             selected_has_key: false,
             pending: None,
             account_probe: live_account_email,
-            limits: HashMap::new(),
+            limits,
             auth_modes: HashMap::new(),
             codex_plans: HashMap::new(),
+            agy_plans: HashMap::new(),
             limits_selection: None,
             last_limits_refresh: None,
             limits_now: Utc::now(),
@@ -315,6 +328,16 @@ impl App {
 
     fn refresh(&mut self) -> Result<()> {
         self.profiles = self.manager.list_profiles()?;
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|profile| profile.tool == Tool::Antigravity)
+        {
+            self.limits.insert(
+                profile.name.clone(),
+                agy_limits::read_limits(&self.manager.base_dir, &profile.name, Utc::now()),
+            );
+        }
         self.reload_usage_data();
         self.apply_filter();
         if self.filtered_indices.is_empty() {
@@ -420,6 +443,15 @@ impl App {
                     self.limits.insert(
                         name.clone(),
                         codex::read_limits(&dir, account_id.as_deref()),
+                    );
+                } else if tool == Tool::Antigravity {
+                    self.agy_plans.insert(
+                        name.clone(),
+                        agy_limits::plan_tier(&self.manager.base_dir, name, self.limits_now),
+                    );
+                    self.limits.insert(
+                        name.clone(),
+                        agy_limits::read_limits(&self.manager.base_dir, name, self.limits_now),
                     );
                 }
                 self.limits_selection = selected;
@@ -872,6 +904,26 @@ impl App {
                     .selected_profile()
                     .is_some_and(|p| key::has_key(&self.manager, &p.name));
                 self.mode = Mode::ConfirmRefresh;
+            }
+
+            KeyCode::Char('Q') if self.selected_profile().is_some() => {
+                let profile = self.selected_profile().unwrap();
+                if profile.tool != Tool::Antigravity {
+                    self.mode =
+                        Mode::Message("Live quota refresh is Antigravity-only.".into(), true);
+                } else {
+                    let name = profile.name.clone();
+                    let result =
+                        agy_statusline::refresh_for_profile(&self.manager, &name, Utc::now());
+                    self.last_limits_refresh = None;
+                    self.refresh_limits_if_due(Instant::now());
+                    self.mode = match result {
+                        Ok(()) => {
+                            Mode::Message(format!("{name}: Antigravity quota refreshed."), false)
+                        }
+                        Err(error) => Mode::Message(error.to_string(), true),
+                    };
+                }
             }
 
             _ => {}
@@ -1641,7 +1693,26 @@ impl App {
                     Line::from(vec![
                         Span::styled("  ", Style::default()),
                         Span::styled(
-                            format!("{} · {email}", p.tool.label()),
+                            if p.tool == Tool::Antigravity {
+                                let detail = match self.limits.get(&p.name) {
+                                    Some(Limits::Snapshot(snapshot)) => format!(
+                                        "5h {} · 7d {} · {}",
+                                        snapshot
+                                            .session()
+                                            .map(|w| w.percent_label(self.limits_now))
+                                            .unwrap_or_else(|| "—".into()),
+                                        snapshot
+                                            .weekly()
+                                            .map(|w| w.percent_label(self.limits_now))
+                                            .unwrap_or_else(|| "—".into()),
+                                        snapshot.age(self.limits_now)
+                                    ),
+                                    _ => "5h — · 7d — · no data".into(),
+                                };
+                                format!("agy · {detail}")
+                            } else {
+                                format!("{} · {email}", p.tool.label())
+                            },
                             Style::default().fg(DIM),
                         ),
                     ]),
@@ -1752,21 +1823,28 @@ impl App {
                 ),
             ]),
         ];
-        if profile.tool == Tool::Codex {
+        if profile.tool == Tool::Codex || profile.tool == Tool::Antigravity {
             lines.push(Line::from(vec![
                 Span::styled("  Plan         ", Style::default().fg(DIM)),
                 Span::styled(
-                    self.codex_plans
-                        .get(&profile.name)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_else(|| "—".into()),
+                    (if profile.tool == Tool::Codex {
+                        &self.codex_plans
+                    } else {
+                        &self.agy_plans
+                    })
+                    .get(&profile.name)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| "—".into()),
                     Style::default().fg(TEXT),
                 ),
             ]));
         }
         lines.push(Line::from(""));
-        if profile.tool != Tool::Claude && profile.tool != Tool::Codex {
+        if profile.tool != Tool::Claude
+            && profile.tool != Tool::Codex
+            && profile.tool != Tool::Antigravity
+        {
             lines.push(Line::from("  Plan limits  —"));
         } else {
             match self.limits.get(&profile.name) {
@@ -1791,6 +1869,8 @@ impl App {
                 Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
                     if profile.tool == Tool::Codex {
                         "  Plan limits  mismatch: another account's report"
+                    } else if profile.tool == Tool::Antigravity {
+                        "  Plan limits  no saved quota"
                     } else {
                         "  Plan limits  mismatch: another account's snapshot"
                     },
@@ -1799,6 +1879,8 @@ impl App {
                 Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
                     if profile.tool == Tool::Codex {
                         "  Plan limits  unreadable: session files couldn't be read"
+                    } else if profile.tool == Tool::Antigravity {
+                        "  Plan limits  unreadable: saved quota couldn't be read"
                     } else {
                         "  Plan limits  unreadable: file couldn't be read"
                     },
@@ -1807,15 +1889,30 @@ impl App {
                 Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
                     if profile.tool == Tool::Codex {
                         "  Plan limits  no data: no Codex report yet"
+                    } else if profile.tool == Tool::Antigravity {
+                        "  Plan limits  no data: install line or press Q to refresh"
                     } else {
                         "  Plan limits  no data: no cached snapshot yet"
                     },
                     Style::default().fg(MUTED),
                 ))),
             }
-            if profile.tool == Tool::Claude || profile.tool == Tool::Codex {
+            if profile.tool == Tool::Claude
+                || profile.tool == Tool::Codex
+                || profile.tool == Tool::Antigravity
+            {
                 lines.push(Line::from(""));
-                for line in self.usage_panel_text(&profile.name).lines() {
+                let usage = if profile.tool == Tool::Antigravity {
+                    crate::usage_tokens_info(
+                        self.usage_cache.hourly.as_ref(),
+                        &profile.name,
+                        self.limits_now,
+                        Local::now().offset().fix(),
+                    )
+                } else {
+                    self.usage_panel_text(&profile.name)
+                };
+                for line in usage.lines() {
                     for wrapped in wrap_usage_line(line, inner.width as usize) {
                         lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
                     }
@@ -1874,6 +1971,7 @@ impl App {
                 ("p", "set key"),
                 ("P", "clear key"),
                 ("r", "refresh"),
+                ("Q", "agy quota"),
                 ("d", "delete"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1919,6 +2017,7 @@ impl App {
             ("p", "Set API key for selected profile"),
             ("P", "Clear API key after confirmation"),
             ("r", "Refresh — overwrite with current session"),
+            ("Q", "Refresh selected Antigravity quota (network)"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
             ("q / Esc", "Quit"),
@@ -3819,6 +3918,73 @@ mod tests {
         assert!(display.contains("Plan limits  no data: no Codex report yet"));
         assert!(display.contains("CODEX_HOME"));
         assert!(!display.contains("no data: no cached snapshot"));
+    }
+
+    #[test]
+    fn antigravity_tui_shows_gemini_list_bars_third_party_detail_and_tokens_only() {
+        // Known-bad: the TUI keeps Antigravity at Plan limits — or shows 3p as headline bars.
+        let temp = TempDir::new().unwrap();
+        let mut app = make_app(&temp, &[("spare", Some("spare@example.com"))]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("spare").unwrap().tool = Tool::Antigravity;
+        fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.profiles[0].tool = Tool::Antigravity;
+        let now = Utc::now();
+        let reset = (now + chrono::Duration::days(3)).to_rfc3339();
+        let quota = serde_json::json!({
+            "gemini-5h":{"remaining_fraction":0.88,"reset_time":reset},
+            "gemini-weekly":{"remaining_fraction":0.65,"reset_time":reset},
+            "3p-5h":{"remaining_fraction":0.99,"reset_time":reset},
+            "3p-weekly":{"remaining_fraction":0.98,"reset_time":reset}
+        });
+        agy_limits::save(
+            &app.manager.base_dir,
+            "spare",
+            &quota,
+            Some("Google AI Pro"),
+            now,
+        )
+        .unwrap();
+        fs::create_dir_all(&app.usage_dir).unwrap();
+        fs::write(
+            app.usage_dir.join("hourly.json"),
+            serde_json::to_vec(&m::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![m::Bucket {
+                    profile: "spare".into(),
+                    hour: now - chrono::Duration::hours(1),
+                    model: "(unknown)".into(),
+                    speed: None,
+                    prompt_tier: None,
+                    requests: 1,
+                    input: 100,
+                    output: 10,
+                    cache_write_5m: 0,
+                    cache_write_1h: 0,
+                    cache_read: 20,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        app.reload_usage_data();
+        app.limits_now = now;
+        app.refresh_limits_if_due(Instant::now());
+        let display = render_text(&mut app);
+        assert!(display.contains("5h 12% · 7d 35%"), "{display}");
+        assert!(display.contains("Plan limits  as of"), "{display}");
+        assert!(
+            display.contains("3p 5h") && display.contains("3p weekly"),
+            "{display}"
+        );
+        assert!(display.contains("Google AI Pro"), "{display}");
+        assert!(display.contains("tokens only"), "{display}");
+        assert!(!display.contains("$0."), "{display}");
     }
 
     #[test]

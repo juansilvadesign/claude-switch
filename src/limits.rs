@@ -61,6 +61,7 @@ pub enum Limits {
 pub enum LimitSource {
     Claude,
     Codex,
+    Antigravity,
 }
 
 pub fn parse_limits(claude_json: &Value) -> Limits {
@@ -290,6 +291,7 @@ pub fn format_info(limits: &Limits, now: DateTime<Utc>, source: LimitSource) -> 
             LimitSource::Codex => {
                 "Plan limits: no Codex session has reported one yet.\n".to_string()
             }
+            LimitSource::Antigravity => "Plan limits: no saved Antigravity quota yet — install `cswitch agy-statusline --install <name>` or refresh with `cswitch info <name> --refresh-quota`.\n".to_string(),
         },
         Limits::AccountMismatch => match source {
             LimitSource::Claude => {
@@ -300,10 +302,12 @@ pub fn format_info(limits: &Limits, now: DateTime<Utc>, source: LimitSource) -> 
                 "Plan limits: the last report belongs to another account, so it's hidden.\n"
                     .to_string()
             }
+            LimitSource::Antigravity => "Plan limits: no saved Antigravity quota yet.\n".to_string(),
         },
         Limits::Unreadable => match source {
             LimitSource::Claude => "Plan limits: the file couldn't be read.\n".to_string(),
             LimitSource::Codex => "Plan limits: the session files couldn't be read.\n".to_string(),
+            LimitSource::Antigravity => "Plan limits: the saved Antigravity quota couldn't be read.\n".to_string(),
         },
         Limits::Snapshot(snapshot) => {
             let mut output = match source {
@@ -313,6 +317,10 @@ pub fn format_info(limits: &Limits, now: DateTime<Utc>, source: LimitSource) -> 
                 ),
                 LimitSource::Codex => format!(
                     "Plan limits (Codex's last report, {}):\n",
+                    snapshot.age(now)
+                ),
+                LimitSource::Antigravity => format!(
+                    "Plan limits (Antigravity saved quota, {}):\n",
                     snapshot.age(now)
                 ),
             };
