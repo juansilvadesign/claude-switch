@@ -1,6 +1,7 @@
 use super::attribute::{
     capture_signals, load_config, load_labels, merge_touch_signals, transfer_touch_signals,
 };
+use super::codex;
 use super::parse::{CostState, Request, parse};
 use crate::atomic;
 use anyhow::Result;
@@ -8,8 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone)]
 pub struct Source {
@@ -46,6 +48,8 @@ pub struct Cursor {
     pub size: u64,
     pub offset: u64,
     pub partial: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ns: Option<u128>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -143,11 +147,16 @@ fn device_inode(_metadata: &fs::Metadata) -> (u64, u64) {
 pub struct Store {
     pub dir: PathBuf,
     pub sources: Vec<Source>,
+    pub codex_sources: Vec<Source>,
 }
 
 impl Store {
     pub fn new(dir: PathBuf, sources: Vec<Source>) -> Self {
-        Self { dir, sources }
+        Self {
+            dir,
+            sources,
+            codex_sources: Vec::new(),
+        }
     }
 
     pub fn load(&self) -> Result<Ledger> {
@@ -296,6 +305,7 @@ impl Store {
                     size: metadata.len(),
                     offset: offset + complete_len as u64,
                     partial,
+                    modified_ns: None,
                 };
                 let mut line_offset = offset;
                 for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
@@ -423,6 +433,31 @@ impl Store {
                 ledger.cursors.files.insert(path_key, cursor);
             }
         }
+        let mut codex_sources = self.codex_sources.clone();
+        codex_sources.sort_by(|a, b| a.profile.cmp(&b.profile));
+        for source in &codex_sources {
+            let mut files = Vec::new();
+            for folder in ["sessions", "archived_sessions"] {
+                let root = source.directory.join(folder);
+                if fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+                    transcript_files(&root, &mut files)?;
+                }
+            }
+            files.sort();
+            let mut changed = false;
+            for path in files {
+                changed |= ingest_codex_file(
+                    &path,
+                    source,
+                    &mut ledger,
+                    &config,
+                    &mut keys,
+                    &mut sessions,
+                    &mut report,
+                )?;
+            }
+            read_codex_index(source, changed, &mut ledger)?;
+        }
         report.partial = ledger
             .cursors
             .files
@@ -461,9 +496,13 @@ impl Store {
         ledger.requests.retain(|row| row.profile != profile);
         ledger.sessions.retain(|row| row.profile != profile);
         ledger.cursors.files.retain(|path, _| {
-            !self.sources.iter().any(|source| {
-                source.profile == profile && Path::new(path).starts_with(&source.directory)
-            })
+            !self
+                .sources
+                .iter()
+                .chain(&self.codex_sources)
+                .any(|source| {
+                    source.profile == profile && Path::new(path).starts_with(&source.directory)
+                })
         });
         self.save_data(&ledger)?;
         let mut labels = load_labels(&self.dir)?;
@@ -481,6 +520,207 @@ impl Store {
         save_json(&self.dir.join("cursors.json"), &ledger.cursors)?;
         Ok(before - ledger.requests.len())
     }
+}
+
+fn ingest_codex_file(
+    path: &Path,
+    source: &Source,
+    ledger: &mut Ledger,
+    config: &super::attribute::Config,
+    keys: &mut HashMap<String, usize>,
+    sessions: &mut HashMap<(String, String), usize>,
+    report: &mut IngestReport,
+) -> Result<bool> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    let (device, inode) = device_inode(&metadata);
+    let path_key = path.to_string_lossy().into_owned();
+    let previous = ledger.cursors.files.get(&path_key);
+    if previous.is_some_and(|cursor| {
+        cursor.device == device
+            && cursor.inode == inode
+            && cursor.size == metadata.len()
+            && cursor.offset <= metadata.len()
+    }) {
+        return Ok(false);
+    }
+    let old_offset = previous
+        .filter(|cursor| {
+            cursor.device == device && cursor.inode == inode && metadata.len() >= cursor.size
+        })
+        .map_or(0, |cursor| cursor.offset);
+    let mut reader = BufReader::new(file);
+    let mut parser = codex::Reader::default();
+    let mut line = Vec::new();
+    let mut position = 0u64;
+    let mut complete = 0u64;
+    let mut partial = false;
+    loop {
+        line.clear();
+        let length = reader.read_until(b'\n', &mut line)?;
+        if length == 0 {
+            break;
+        }
+        let line_offset = position;
+        position += length as u64;
+        report.bytes_read += length as u64;
+        if !line.ends_with(b"\n") {
+            partial = true;
+            break;
+        }
+        complete = position;
+        line.pop();
+        if !codex::relevant(&line) {
+            continue;
+        }
+        match parser.line(&line, &source.profile) {
+            Ok(Some(mut request)) if line_offset >= old_offset => {
+                capture_signals(&mut request, config);
+                let session_key = (source.profile.clone(), request.session.clone());
+                let index = *sessions.entry(session_key).or_insert_with(|| {
+                    ledger.sessions.push(Session {
+                        profile: source.profile.clone(),
+                        id: request.session.clone(),
+                        first: None,
+                        last: None,
+                        titles: Vec::new(),
+                        cost_state: None,
+                    });
+                    ledger.sessions.len() - 1
+                });
+                let session = &mut ledger.sessions[index];
+                session.first = Some(
+                    session
+                        .first
+                        .map_or(request.time, |first| first.min(request.time)),
+                );
+                session.last = Some(
+                    session
+                        .last
+                        .map_or(request.time, |last| last.max(request.time)),
+                );
+                if let Some(&existing) = keys.get(&request.key) {
+                    report.duplicates += 1;
+                    let old = &mut ledger.requests[existing];
+                    merge_touch_signals(old, &request);
+                    if request.output > old.output {
+                        transfer_touch_signals(old, &mut request);
+                        *old = request;
+                    }
+                } else {
+                    keys.insert(request.key.clone(), ledger.requests.len());
+                    ledger.requests.push(request);
+                    report.new_requests += 1;
+                }
+            }
+            Ok(_) => {}
+            Err(()) if line_offset >= old_offset => report.malformed += 1,
+            Err(()) => {}
+        }
+    }
+    ledger.cursors.files.insert(
+        path_key,
+        Cursor {
+            device,
+            inode,
+            size: position,
+            offset: complete,
+            partial,
+            modified_ns: None,
+        },
+    );
+    Ok(true)
+}
+
+fn read_codex_index(source: &Source, files_changed: bool, ledger: &mut Ledger) -> Result<()> {
+    const MAX_INDEX: u64 = 8 * 1024 * 1024;
+    let path = source.directory.join("session_index.jsonl");
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) if metadata.len() <= MAX_INDEX => metadata,
+        _ => return Ok(()),
+    };
+    let (device, inode) = device_inode(&metadata);
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let path_key = path.to_string_lossy().into_owned();
+    if !files_changed
+        && ledger.cursors.files.get(&path_key).is_some_and(|cursor| {
+            cursor.device == device
+                && cursor.inode == inode
+                && cursor.size == metadata.len()
+                && cursor.modified_ns == modified_ns
+        })
+    {
+        return Ok(());
+    }
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    if reader.read_to_end(&mut bytes).is_err() {
+        return Ok(());
+    }
+    let mut titles = HashMap::<String, Vec<Title>>::new();
+    let mut offset = 0u64;
+    let mut valid = false;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        if let Ok(row) = serde_json::from_slice::<serde_json::Value>(line)
+            && let (Some(id), Some(name), Some(at)) = (
+                row.get("id").and_then(|value| value.as_str()),
+                row.get("thread_name").and_then(|value| value.as_str()),
+                row.get("updated_at")
+                    .and_then(|value| value.as_str())
+                    .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok()),
+            )
+        {
+            valid = true;
+            titles.entry(id.to_string()).or_default().push(Title {
+                time: Some(at.with_timezone(&Utc)),
+                file: path_key.clone(),
+                offset,
+                value: name.to_string(),
+                source: "ai-title".into(),
+            });
+        }
+        offset += line.len() as u64;
+    }
+    if !bytes.is_empty() && !valid {
+        return Ok(());
+    }
+    for session in ledger
+        .sessions
+        .iter_mut()
+        .filter(|session| session.profile == source.profile)
+    {
+        session.titles.retain(|title| title.file != path_key);
+        if let Some(mut names) = titles.remove(&session.id) {
+            session.titles.append(&mut names);
+        }
+    }
+    ledger.cursors.files.insert(
+        path_key,
+        Cursor {
+            device,
+            inode,
+            size: metadata.len(),
+            offset: bytes.len() as u64,
+            partial: false,
+            modified_ns,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(test)]

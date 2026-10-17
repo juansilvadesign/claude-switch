@@ -149,12 +149,16 @@ impl UsageCache {
         let cells = profiles
             .iter()
             .map(|profile| {
-                let cell = if profile.tool == Tool::Claude {
-                    let auth = key::read_auth_mode(
-                        manager,
-                        &profile.name,
-                        read_claude_json(&manager.profile_dir(&profile.name)),
-                    );
+                let cell = if profile.tool == Tool::Claude || profile.tool == Tool::Codex {
+                    let auth = if profile.tool == Tool::Claude {
+                        key::read_auth_mode(
+                            manager,
+                            &profile.name,
+                            read_claude_json(&manager.profile_dir(&profile.name)),
+                        )
+                    } else {
+                        AuthMode::NotLoggedIn
+                    };
                     crate::usage_30d_cell(
                         &profile.name,
                         &auth,
@@ -1809,7 +1813,7 @@ impl App {
                     Style::default().fg(MUTED),
                 ))),
             }
-            if profile.tool == Tool::Claude {
+            if profile.tool == Tool::Claude || profile.tool == Tool::Codex {
                 lines.push(Line::from(""));
                 for line in self.usage_panel_text(&profile.name).lines() {
                     for wrapped in wrap_usage_line(line, inner.width as usize) {
@@ -3866,6 +3870,62 @@ mod tests {
             let display = render_text(&mut app);
             assert!(display.contains(expected), "{display}");
         }
+    }
+
+    #[test]
+    fn codex_usage_cell_matches_list_and_detail_shows_usage() {
+        // Known-bad: a Codex profile has ledger data but its TUI cell stays a dash.
+        let temp = TempDir::new().unwrap();
+        let mut app = make_app(&temp, &[("spare", Some("spare@example.com"))]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("spare").unwrap().tool = Tool::Codex;
+        fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.profiles[0].tool = Tool::Codex;
+        let now = Utc::now();
+        fs::create_dir_all(&app.usage_dir).unwrap();
+        fs::write(
+            app.usage_dir.join("hourly.json"),
+            serde_json::to_vec(&m::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![m::Bucket {
+                    profile: "spare".into(),
+                    hour: now - chrono::Duration::hours(1),
+                    model: "gpt-6-sol".into(),
+                    speed: None,
+                    prompt_tier: Some(crate::usage::rates::PromptTier {
+                        over_tokens: 272_000,
+                        long: false,
+                    }),
+                    requests: 1,
+                    input: 100_000,
+                    output: 0,
+                    cache_write_5m: 0,
+                    cache_write_1h: 0,
+                    cache_read: 0,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        app.limits_now = now;
+        app.usage_cache = UsageCache::load(&app.manager, &app.profiles, &app.usage_dir, now);
+        let cell = app.usage_cache.cells.get("spare").unwrap();
+        assert_eq!(cell, "~$0.20");
+        let list = crate::list_output(&app.manager, now).unwrap();
+        assert!(
+            list.lines()
+                .find(|line| line.starts_with("spare "))
+                .unwrap()
+                .contains(cell)
+        );
+        assert!(app.usage_panel_text("spare").contains("$0.20 list price"));
+        let detail = render_text(&mut app);
+        assert!(detail.contains("Usage (ledger as of"), "{detail}");
     }
 
     #[test]

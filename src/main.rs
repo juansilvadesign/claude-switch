@@ -41,6 +41,83 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[cfg(test)]
+mod codex_usage_view_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn codex_list_and_info_show_list_value_and_alias_clears_star() {
+        // Known-bad: a Codex row uses per-token spend or omits its usage block.
+        let temp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(temp.path().join("switch"), temp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 1, 13, 0, 0).unwrap();
+        let mut registry = profile::Registry::default();
+        registry.profiles.insert(
+            "spare".into(),
+            profile::Profile {
+                name: "spare".into(),
+                tool: Tool::Codex,
+                email: Some("spare@example.com".into()),
+                added: now,
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let session = manager.profile_dir("spare").join(
+            "sessions/2030/01/01/rollout-2030-01-01-00000000-0000-4000-8000-000000000000.jsonl",
+        );
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        let mut file = File::create(&session).unwrap();
+        writeln!(file, r#"{{"timestamp":"2030-01-01T12:00:00Z","type":"session_meta","payload":{{"id":"00000000-0000-4000-8000-000000000000","source":"cli"}}}}"#).unwrap();
+        for (turn, model, response) in [
+            ("a", "gpt-6-sol", "response-a"),
+            ("b", "codex-auto-review", "response-b"),
+        ] {
+            writeln!(file, r#"{{"timestamp":"2030-01-01T12:00:00Z","type":"turn_context","payload":{{"turn_id":"{turn}","model":"{model}"}}}}"#).unwrap();
+            writeln!(file, r#"{{"timestamp":"2030-01-01T12:01:00Z","type":"token_usage_record","payload":{{"response_id":"{response}","turn_id":"{turn}","usage":{{"input_tokens":100000,"output_tokens":10000}}}}}}"#).unwrap();
+        }
+        drop(file);
+        let store = usage::store(&manager, None).unwrap();
+        store.ingest().unwrap();
+        let list = list_output(&manager, now).unwrap();
+        let row = list
+            .lines()
+            .find(|line| line.starts_with("spare "))
+            .unwrap();
+        assert!(row.contains("~$0.30*"), "{row}");
+        let info = info_output(&manager, "spare", now).unwrap();
+        let usage_block = info.split("Usage (ledger as of ").nth(1).unwrap();
+        assert!(
+            usage_block.contains("Today")
+                && usage_block.contains("7 days")
+                && usage_block.contains("30 days"),
+            "{info}"
+        );
+        assert!(
+            usage_block.contains("list price") && usage_block.contains("$0.30*"),
+            "{info}"
+        );
+        for billing in ["Plan:", "Rate:", "Effective:", "Capacity:", "Reset:"] {
+            assert!(!usage_block.contains(billing), "{info}");
+        }
+        usage::rates::edit_alias(&store.dir, "codex-auto-review", Some("gpt-6-sol")).unwrap();
+        store.ingest().unwrap();
+        let row = list_output(&manager, now).unwrap();
+        let row = row.lines().find(|line| line.starts_with("spare ")).unwrap();
+        assert!(row.contains("~$0.60") && !row.contains('*'), "{row}");
+    }
+}
+
 impl Cli {
     fn try_parse_from<I, T>(input: I) -> std::result::Result<Self, clap::Error>
     where
@@ -1112,6 +1189,14 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                 .and_then(|bytes| codex::account_id_from_auth(&bytes));
             let limits = codex::read_limits(&dir, account_id.as_deref());
             output.push_str(&format_info(&limits, now, LimitSource::Codex));
+            output.push_str(&usage_info(
+                &usage_directory(manager),
+                &profile.name,
+                &key::AuthMode::NotLoggedIn,
+                now,
+                Local::now().offset().fix(),
+                &limits,
+            ));
         } else if profile.tool == Tool::Antigravity {
             output.push_str(&format!(
                 "Home:      {}\n",
@@ -1419,6 +1504,7 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             .map(|t| t.format("%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".into());
         let (session, weekly, age, cell) = if p.tool == Tool::Codex {
+            saw_claude = true;
             let dir = manager.profile_dir(&p.name);
             let account_id = std::fs::read(dir.join("auth.json"))
                 .ok()
@@ -1435,7 +1521,16 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
                 Limits::AccountMismatch => ("—".into(), "—".into(), "mismatch".into()),
                 Limits::Unreadable => ("—".into(), "—".into(), "unreadable".into()),
             };
-            (session, weekly, age, "—".into())
+            let cell = usage_30d_cell(
+                &p.name,
+                &key::AuthMode::NotLoggedIn,
+                hourly.as_ref(),
+                &settings,
+                now,
+                Local::now().offset().fix(),
+            );
+            saw_usage |= cell != "—";
+            (session, weekly, age, cell)
         } else if p.tool != Tool::Claude {
             ("—".into(), "—".into(), "—".into(), "—".into())
         } else {

@@ -82,9 +82,19 @@ fn model(
     }
 }
 
+fn openai_price(input: f64, cache_read: f64, cache_write: f64, output: f64) -> Price {
+    Price {
+        input,
+        output,
+        cache_write_5m: cache_write,
+        cache_write_1h: cache_write,
+        cache_read,
+    }
+}
+
 pub fn seed() -> Rates {
     Rates {
-        source: "Anthropic first-party list prices, https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-10)".into(),
+        source: "Anthropic first-party list prices, https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-10); OpenAI API list prices, https://developers.openai.com/api/docs/pricing (read 2026-10-14)".into(),
         unit: "USD per million tokens".into(),
         aliases: BTreeMap::new(),
         models: BTreeMap::from([
@@ -95,6 +105,24 @@ pub fn seed() -> Rates {
             ("claude-haiku-4-5-20251001".into(), model(1.0, 5.0, 1.25, 2.0, 0.1)),
             ("claude-sonnet-5-5".into(), model(2.0, 10.0, 2.5, 4.0, 0.1)),
             ("claude-fable-5-1".into(), model(10.0, 50.0, 12.5, 20.0, 0.25)),
+            ("gpt-6-sol".into(), ModelRate {
+                standard: openai_price(2.0, 0.2, 2.5, 10.0),
+                fast: Some(openai_price(4.0, 0.4, 5.0, 20.0)),
+                long_prompt: Some(LongPrompt {
+                    over_tokens: 272_000,
+                    standard: openai_price(4.0, 0.4, 5.0, 15.0),
+                    fast: Some(openai_price(8.0, 0.8, 10.0, 30.0)),
+                }),
+            }),
+            ("gpt-6-astra".into(), ModelRate {
+                standard: openai_price(10.0, 1.0, 12.5, 50.0),
+                fast: Some(openai_price(20.0, 2.0, 25.0, 100.0)),
+                long_prompt: Some(LongPrompt {
+                    over_tokens: 272_000,
+                    standard: openai_price(20.0, 2.0, 25.0, 75.0),
+                    fast: Some(openai_price(40.0, 4.0, 50.0, 150.0)),
+                }),
+            }),
             ("claude-haiku-5-5".into(), ModelRate {
                 long_prompt: Some(LongPrompt {
                     over_tokens: 100_000,
@@ -165,10 +193,10 @@ impl Rates {
         } else {
             (&model.standard, model.fast.as_ref())
         };
-        if speed == Some("fast") {
-            fast
-        } else {
-            Some(standard)
+        match speed {
+            Some("fast") => fast,
+            None | Some("standard") => Some(standard),
+            _ => None,
         }
     }
 }
@@ -256,7 +284,7 @@ mod tests {
         let rates = seed();
         assert_eq!(
             rates.source,
-            "Anthropic first-party list prices, https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-10)"
+            "Anthropic first-party list prices, https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-10); OpenAI API list prices, https://developers.openai.com/api/docs/pricing (read 2026-10-14)"
         );
         let values = |price: &Price| {
             [

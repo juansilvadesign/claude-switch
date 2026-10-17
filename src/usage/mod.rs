@@ -1,6 +1,9 @@
 pub mod attribute;
 pub mod billing;
 pub mod chats;
+pub mod codex;
+#[cfg(test)]
+mod codex_tests;
 pub mod ledger;
 pub mod metrics;
 pub mod parse;
@@ -35,10 +38,25 @@ pub fn store(manager: &ProfileManager, override_dir: Option<PathBuf>) -> Result<
             profile: profile.name,
         });
     }
-    Ok(Store::new(
+    let mut store = Store::new(
         override_dir.unwrap_or_else(|| manager.base_dir.join("usage")),
         sources,
-    ))
+    );
+    store.codex_sources.push(Source {
+        profile: "codex:default".into(),
+        directory: home.join(".codex"),
+    });
+    for profile in manager
+        .list_profiles()?
+        .into_iter()
+        .filter(|p| p.tool == Tool::Codex)
+    {
+        store.codex_sources.push(Source {
+            directory: manager.profile_dir(&profile.name),
+            profile: profile.name,
+        });
+    }
+    Ok(store)
 }
 
 #[cfg(test)]
