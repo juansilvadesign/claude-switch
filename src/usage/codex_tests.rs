@@ -117,15 +117,11 @@ fn codex_record_uses_own_counts_and_prices_once() {
     reader
         .line(turn("turn-a", "gpt-6-sol").as_bytes(), "sample")
         .unwrap();
+    let mut counts = usage(200_000, 120_000, 20_000, 10_000);
+    counts["reasoning_output_tokens"] = json!(8_000);
     let request = reader
         .line(
-            record(
-                "response-a",
-                "turn-a",
-                AT,
-                usage(200_000, 120_000, 20_000, 10_000),
-            )
-            .as_bytes(),
+            record("response-a", "turn-a", AT, counts).as_bytes(),
             "sample",
         )
         .unwrap()
