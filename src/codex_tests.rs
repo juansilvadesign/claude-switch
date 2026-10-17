@@ -135,12 +135,12 @@ fn codex_newest_event_uses_mtime_and_skips_premium() {
         9,
         None,
         &[event(
-            "2030-01-01T01:00:00Z",
+            "2030-01-01T12:00:00Z",
             "codex",
             window(300, json!(70), None),
             Value::Null,
         )],
-        "2030-01-03T00:00:00Z",
+        "2030-01-02T00:00:00Z",
     );
     session(
         temp.path(),
@@ -148,18 +148,42 @@ fn codex_newest_event_uses_mtime_and_skips_premium() {
         None,
         &[
             event(
-                "2030-01-02T01:00:00Z",
+                "2030-01-03T00:00:00Z",
                 "codex",
                 window(300, json!(12), None),
                 Value::Null,
             ),
-            event("2030-01-02T02:00:00Z", "premium", Value::Null, Value::Null),
+            event("2030-01-03T01:00:00Z", "premium", Value::Null, Value::Null),
         ],
         "2030-01-04T00:00:00Z",
     );
+    reset_read_stats();
     let result = snapshot(read_limits(temp.path(), None));
-    assert_eq!(result.fetched_at, at("2030-01-02T01:00:00Z"));
+    assert_eq!(result.fetched_at, at("2030-01-03T00:00:00Z"));
     assert_eq!(result.session().unwrap().percent, 12.0);
+    assert_eq!(read_stats(), 1);
+}
+
+#[test]
+fn codex_same_mtime_and_event_uses_larger_path() {
+    // Known-bad: equal modification times use the smaller path first.
+    let temp = TempDir::new().unwrap();
+    for (number, percent) in [(1, 12), (9, 70)] {
+        session(
+            temp.path(),
+            number,
+            None,
+            &[event(
+                "2030-01-01T12:00:00Z",
+                "codex",
+                window(300, json!(percent), None),
+                Value::Null,
+            )],
+            "2030-01-02T00:00:00Z",
+        );
+    }
+    let result = snapshot(read_limits(temp.path(), None));
+    assert_eq!(result.session().unwrap().percent, 70.0);
 }
 
 #[test]
@@ -339,29 +363,37 @@ fn codex_account_match_needs_both_ids() {
 
 #[test]
 fn codex_bad_lines_do_not_break_the_read() {
-    // Known-bad: one malformed or oversized line returns Unreadable.
+    // Known-bads: a malformed line returns Unreadable, or info:null hides valid limits.
     let temp = TempDir::new().unwrap();
     let path = session(temp.path(), 1, None, &[], "2030-01-01T02:00:00Z");
+    let mut event_with_info = event(
+        "2030-01-01T01:00:00Z",
+        "codex",
+        window(300, json!(42), None),
+        window(10_080, json!("bad"), None),
+    );
+    event_with_info["payload"]["info"] = json!({"total_token_usage": {"total_tokens": 1}});
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
     writeln!(file, "{}", "x".repeat(2 * 1024 * 1024)).unwrap();
+    writeln!(file, "{event_with_info}").unwrap();
+    writeln!(file, "{}", json!({"timestamp":"2030-01-01T00:30:00Z", "type":"event_msg", "payload":{"type":"token_count", "rate_limits":null}})).unwrap();
+    writeln!(file, "not-json").unwrap();
     writeln!(
         file,
         "{}",
         event(
-            "2030-01-01T01:00:00Z",
+            "2030-01-01T01:30:00Z",
             "codex",
-            window(300, json!(42), None),
-            window(10_080, json!("bad"), None)
+            window(300, json!(43), None),
+            Value::Null
         )
     )
     .unwrap();
-    writeln!(file, "{}", json!({"timestamp":"2030-01-01T00:30:00Z", "type":"event_msg", "payload":{"type":"token_count", "rate_limits":null}})).unwrap();
-    writeln!(file, "not-json").unwrap();
     write!(file, "{{\"timestamp\":").unwrap();
     drop(file);
     modified(&path, "2030-01-01T02:00:00Z");
     let result = snapshot(read_limits(temp.path(), None));
-    assert_eq!(result.session().unwrap().percent, 42.0);
+    assert_eq!(result.session().unwrap().percent, 43.0);
     assert!(result.weekly().is_none());
     assert_eq!(result.windows.len(), 1);
 }
