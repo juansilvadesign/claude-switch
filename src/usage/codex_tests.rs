@@ -759,8 +759,10 @@ fn claude_only_ledger_and_reports_match_claude_source_path() {
         unattributed: false,
     };
     let now = at("2030-01-02T00:00:00Z");
+    let modern_report = super::report::run(&modern, &options, now).unwrap();
+    assert!(modern_report.contains("$0.30"), "{modern_report}");
     assert_eq!(
-        super::report::run(&modern, &options, now).unwrap(),
+        modern_report,
         super::report::run(&legacy, &options, now).unwrap()
     );
     assert_eq!(
