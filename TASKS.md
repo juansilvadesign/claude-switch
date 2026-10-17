@@ -6,6 +6,10 @@
 - [x] Show Codex plan limits in list, info and the TUI without changing Claude views.
 - [x] Offer a Codex profile or the plain Codex home when no Claude account qualifies for the status-line hint.
 - [x] Cover Codex limits and the hint with synthetic, hermetic unit and built-binary tests.
+- [x] Read Codex session and archive files into the ledger, with incremental cursors, fallback counts and deduplication.
+- [x] Name Codex threads from the session index and price requests at OpenAI list prices.
+- [x] Show Codex usage in list, info, the TUI and every usage report, including the plain Codex home.
+- [x] Cover the usage flow, read-only behavior and built binary with synthetic fixtures and hermetic gates.
 
 ## Claude Code status line — 2026-10-07
 

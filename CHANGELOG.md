@@ -20,6 +20,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Added
 
+- **Codex usage in the ledger.** `cswitch usage` reads each Codex home's session files, the plain `~/.codex` included, and prices them at OpenAI's list prices. `list`, `info` and the TUI show a Codex profile's `30D $` and its today, 7-day and 30-day figures. The seed adds `gpt-6-sol` and `gpt-6-astra`.
 - **Codex plan limits.** `list`, `info` and the TUI show a Codex profile's 5-hour and weekly limits from the last rate-limit report in its own session files, offline. When no other Claude account has room, the status line's `→` can name a Codex account, the plain `~/.codex` included.
 - **List-price cards by prompt length.** Requests can select a second card when input tokens, including cache writes and reads, exceed a model's threshold. The seed now includes Claude Haiku 5.5, Sonnet 5.5 and Fable 5.1.
 - **A Claude Code status line.** `cswitch statusline` prints a width-aware account, project, plan-limit, headroom, context, chat-cost and daily-cost summary. Subscription figures combine the offline ledger with the live chat estimate; per-token figures use the configured rate. `cswitch usage refresh` silently updates an atomic `chats.json` rollup, and an old ledger starts one detached refresh after the line prints unless `--no-refresh` is set. `--install` and `--uninstall` manage only registered Claude profiles, with a settings backup before every change and a refusal to replace another command's line without `--force`.
@@ -39,6 +40,7 @@ A profile is a **config environment**, not an identity. Its name is a local labe
 
 ### Changed
 
+- **A request whose speed is neither standard nor fast is unpriced** instead of being priced on the standard card.
 - **`usage verify` names a sub-agent shortfall and adds up every class of difference, in tokens and dollars.** Wherever a sub-agent ran, the ledger's dollars are a floor: Claude Code often writes a sub-agent's request to the transcript only as its response starts.
 - **Missing profile emails show `—` in `info` and the TUI.** Claude and Codex profiles previously showed `unknown` there.
 - **Shell aliases run `cswitch use`.** They sync skills before launch and pass Claude flags through.

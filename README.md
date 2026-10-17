@@ -126,7 +126,7 @@ Run `cswitch login <name> --tool codex` or `cswitch add <name> --tool codex`, or
 
 Before login, cswitch copies only `config.toml`, `AGENTS.md`, `agents/`, `rules/` and `skills/` from `CODEX_HOME` (if set and non-empty) or `~/.codex`. It preserves links, but never copies `auth.json`, sessions, logs, sqlite state, secrets or daemon packages. The new login is verified by exit status; the status command's output is discarded because API-key mode can print part of a key. Account email and optional plan type are read offline from the new profile's `auth.json`.
 
-Codex profiles cannot be copied or refreshed from a Claude session. Claude API keys, gateways, skills sync and `cswitch usage` apply only to Claude profiles; a Codex profile's plan limits come from its own session files (see Plan limits). `cswitch list` shows a `TOOL` column, while `info` and TUI details show the tool and any Codex plan type.
+Codex profiles cannot be copied or refreshed from a Claude session. Claude API keys, gateways and skills sync apply only to Claude profiles; a Codex profile's plan limits and token usage come from its own session files (see Plan limits and Token usage). `cswitch list` shows a `TOOL` column, while `info` and TUI details show the tool and any Codex plan type.
 
 ## Antigravity profiles
 
@@ -169,7 +169,11 @@ Install writes only the profile's `settings.json` key `"statusLine": { "type": "
 
 ## Token usage
 
-`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Where a sub-agent ran, the dollar column is a floor: Claude Code often writes a sub-agent's request to the transcript only as its response starts, so the output count there is a placeholder, and its cost state can count requests that no transcript holds; `cswitch usage verify` adds up the difference by class, in tokens and dollars. Unknown models and fast requests without an explicit fast rate show `$*`. A model can have a second price card for long prompts; a rollup row classified under another rate table shows `$*` until the next `cswitch usage refresh`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
+`cswitch usage` reads complete JSONL lines from the default Claude Code directory, the plain `~/.codex` and registered Claude and Codex profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Where a sub-agent ran, the dollar column is a floor: Claude Code often writes a sub-agent's request to the transcript only as its response starts, so the output count there is a placeholder, and its cost state can count requests that no transcript holds; `cswitch usage verify` adds up the difference by class, in tokens and dollars. Unknown models and fast requests without an explicit fast rate show `$*`.
+
+Codex sessions are read from `sessions/` and `archived_sessions/` under each Codex home and priced at OpenAI's list prices; the plain `~/.codex` counts as the profile `codex:default`. `codex-auto-review` has no public price, so it shows `$*` until you alias it, for example `cswitch usage alias codex-auto-review gpt-6-sol`. Sessions written before Codex recorded each request's usage (Codex 0.153.4) are counted from its running totals, which miss a few requests, so their figures are a floor.
+
+A model can have a second price card for long prompts; a rollup row classified under another rate table shows `$*` until the next `cswitch usage refresh`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
 
 ```bash
 cswitch usage --since 30d --by project
@@ -192,7 +196,7 @@ cswitch usage rate keyed --input 1 --output 5 --cache-write-5m 1.25 --cache-writ
 
 `--since` accepts `7d` (default), `30d`, `all`, or `YYYY-MM-DD`; `--by` accepts `profile`, `workspace`, `project`, `session`, `model`, or `day`. The default view is a workspace › project › session tree. Set `CSWITCH_USAGE_DIR` to use another ledger directory, for example when ingesting into a temporary directory. The ledger survives profile removal; `cswitch remove <name> --purge-usage` opts into deleting that profile's ledger rows, billing settings and limit history.
 
-`cswitch list` includes `30D $`: per-token spend or `~` list-price value for other Claude profiles. `cswitch info` shows today, 7-day and 30-day token totals, estimated spend and list value, an owner-entered plan fee, and a weekly capacity estimate. After a configured plan fee or per-token rate, `Effective:` divides that fee or the 30-day spend by the 30-day token count and shows USD per million tokens. It is absent when there are no tokens. Both views read the last offline hourly rollup; run `cswitch usage` to refresh. An absent ledger shows `—` and a refresh hint. `$*` marks unpriced usage. These estimates use the owner's settings and transcript counters; they are not gateway balance queries.
+`cswitch list` includes `30D $`: per-token spend or `~` list-price value for other Claude profiles and for Codex profiles. `cswitch info` shows today, 7-day and 30-day token totals, estimated spend and list value, an owner-entered plan fee, and a weekly capacity estimate. After a configured plan fee or per-token rate, `Effective:` divides that fee or the 30-day spend by the 30-day token count and shows USD per million tokens. It is absent when there are no tokens. Both views read the last offline hourly rollup; run `cswitch usage` to refresh. An absent ledger shows `—` and a refresh hint. `$*` marks unpriced usage. These estimates use the owner's settings and transcript counters; they are not gateway balance queries.
 
 For example, a synthetic plan can show:
 
@@ -216,6 +220,8 @@ A model may have this second card (invented model and prices):
 ```
 
 The prompt length is input tokens plus 5-minute cache writes, 1-hour cache writes and cache reads; output tokens do not count. The long card applies only when that length is **greater than** `over_tokens`. Both `over_tokens` and `long_prompt.standard` are required. An existing `rates.json` is never rewritten, so add new models to it by hand in this shape, then run `cswitch usage refresh` to re-price the history.
+
+An OpenAI model's card uses the same five fields: `input`, `output`, `cache_read` for cached input, and the page's cache-write price in both `cache_write_5m` and `cache_write_1h`. Its long card starts over 272,000 input tokens.
 
 Owner billing settings live in private `~/.claude-switch/usage/billing.json`, created atomically with mode `0600`. Rates are USD per million tokens. A rate applies only to its listed model prefixes; without prefixes it applies to every model. Other models use list price. Example with synthetic values:
 
