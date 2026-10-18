@@ -23,6 +23,7 @@ pub struct Chats {
 pub struct ChatRow {
     pub profile: String,
     pub session: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     pub speed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

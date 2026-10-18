@@ -1,3 +1,4 @@
+use super::agy;
 use super::attribute::{
     capture_signals, load_config, load_labels, merge_touch_signals, transfer_touch_signals,
 };
@@ -148,6 +149,7 @@ pub struct Store {
     pub dir: PathBuf,
     pub sources: Vec<Source>,
     pub codex_sources: Vec<Source>,
+    pub agy_sources: Vec<Source>,
 }
 
 impl Store {
@@ -156,6 +158,7 @@ impl Store {
             dir,
             sources,
             codex_sources: Vec::new(),
+            agy_sources: Vec::new(),
         }
     }
 
@@ -458,6 +461,21 @@ impl Store {
             }
             read_codex_index(source, changed, &mut ledger)?;
         }
+        let mut agy_sources = self.agy_sources.clone();
+        agy_sources.sort_by(|a, b| a.profile.cmp(&b.profile));
+        for source in &agy_sources {
+            for (path, conversation) in agy_transcript_files(&source.directory)? {
+                ingest_agy_file(
+                    &path,
+                    &conversation,
+                    source,
+                    &mut ledger,
+                    &mut keys,
+                    &mut sessions,
+                    &mut report,
+                )?;
+            }
+        }
         report.partial = ledger
             .cursors
             .files
@@ -500,6 +518,7 @@ impl Store {
                 .sources
                 .iter()
                 .chain(&self.codex_sources)
+                .chain(&self.agy_sources)
                 .any(|source| {
                     source.profile == profile && Path::new(path).starts_with(&source.directory)
                 })
@@ -520,6 +539,144 @@ impl Store {
         save_json(&self.dir.join("cursors.json"), &ledger.cursors)?;
         Ok(before - ledger.requests.len())
     }
+}
+
+fn agy_transcript_files(gemini: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
+    for variant in ["antigravity-cli", "antigravity"] {
+        let brain = gemini.join(variant).join("brain");
+        if !fs::symlink_metadata(&brain).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        for entry in fs::read_dir(brain)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(conversation) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let logs = entry.path().join(".system_generated/logs");
+            if !fs::symlink_metadata(&logs).is_ok_and(|metadata| metadata.is_dir()) {
+                continue;
+            }
+            let full = logs.join("transcript_full.jsonl");
+            let short = logs.join("transcript.jsonl");
+            let path = if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_file()) {
+                full
+            } else if fs::symlink_metadata(&short).is_ok_and(|metadata| metadata.is_file()) {
+                short
+            } else {
+                continue;
+            };
+            files.push((path, conversation));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+fn ingest_agy_file(
+    path: &Path,
+    conversation: &str,
+    source: &Source,
+    ledger: &mut Ledger,
+    keys: &mut HashMap<String, usize>,
+    sessions: &mut HashMap<(String, String), usize>,
+    report: &mut IngestReport,
+) -> Result<()> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    let (device, inode) = device_inode(&metadata);
+    let path_key = path.to_string_lossy().into_owned();
+    let previous = ledger.cursors.files.get(&path_key);
+    if previous.is_some_and(|cursor| {
+        cursor.device == device
+            && cursor.inode == inode
+            && cursor.size == metadata.len()
+            && cursor.offset <= metadata.len()
+    }) {
+        return Ok(());
+    }
+    let old_offset = previous
+        .filter(|cursor| {
+            cursor.device == device && cursor.inode == inode && metadata.len() >= cursor.size
+        })
+        .map_or(0, |cursor| cursor.offset);
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(old_offset))?;
+    let parser = agy::Reader::new(conversation);
+    let mut line = Vec::new();
+    let mut position = old_offset;
+    let mut complete = old_offset;
+    let mut partial = false;
+    loop {
+        line.clear();
+        let length = reader.read_until(b'\n', &mut line)?;
+        if length == 0 {
+            break;
+        }
+        position += length as u64;
+        report.bytes_read += length as u64;
+        if !line.ends_with(b"\n") {
+            partial = true;
+            break;
+        }
+        complete = position;
+        line.pop();
+        match parser.line(&line, &source.profile) {
+            Ok(Some(request)) => {
+                let session_key = (source.profile.clone(), request.session.clone());
+                let index = *sessions.entry(session_key).or_insert_with(|| {
+                    ledger.sessions.push(Session {
+                        profile: source.profile.clone(),
+                        id: request.session.clone(),
+                        first: None,
+                        last: None,
+                        titles: Vec::new(),
+                        cost_state: None,
+                    });
+                    ledger.sessions.len() - 1
+                });
+                let session = &mut ledger.sessions[index];
+                session.first = Some(
+                    session
+                        .first
+                        .map_or(request.time, |first| first.min(request.time)),
+                );
+                session.last = Some(
+                    session
+                        .last
+                        .map_or(request.time, |last| last.max(request.time)),
+                );
+                if keys.contains_key(&request.key) {
+                    report.duplicates += 1;
+                } else {
+                    keys.insert(request.key.clone(), ledger.requests.len());
+                    ledger.requests.push(request);
+                    report.new_requests += 1;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => report.malformed += 1,
+        }
+    }
+    ledger.cursors.files.insert(
+        path_key,
+        Cursor {
+            device,
+            inode,
+            size: position,
+            offset: complete,
+            partial,
+            modified_ns: None,
+        },
+    );
+    Ok(())
 }
 
 fn ingest_codex_file(

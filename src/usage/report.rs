@@ -25,7 +25,8 @@ pub struct ReportRow {
     pub project: String,
     pub session: String,
     pub title: Option<String>,
-    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub signal: String,
     pub candidates: Vec<String>,
     pub input: u64,
@@ -44,7 +45,8 @@ struct Totals {
     cache_write_5m: u64,
     cache_write_1h: u64,
     cache_read: u64,
-    cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
     unpriced: bool,
 }
 
@@ -56,18 +58,19 @@ impl Totals {
         self.cache_write_5m += row.cache_write_5m;
         self.cache_write_1h += row.cache_write_1h;
         self.cache_read += row.cache_read;
-        if let Some(cost) = row.cost_usd {
-            self.cost_usd += cost;
-        } else {
-            self.unpriced = true;
+        if row.model.is_some() {
+            self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + row.cost_usd.unwrap_or(0.0));
+            self.unpriced |= row.cost_usd.is_none();
         }
     }
 
     fn cells(&self) -> String {
-        let cost = if self.unpriced {
+        let cost = if self.cost_usd.is_none() {
+            "—".to_string()
+        } else if self.unpriced {
             "$*".to_string()
         } else {
-            format!("${:.2}", self.cost_usd)
+            format!("${:.2}", self.cost_usd.unwrap_or(0.0))
         };
         format!(
             "{:>10} {:>10} {:>11} {:>10} {:>11}",
@@ -160,7 +163,7 @@ fn make_rows(ledger: &Ledger, config: &Config, labels: &Labels, rates: &Rates) -
                 project,
                 session: request.session.clone(),
                 title: display_title(session),
-                model: request.model.clone(),
+                model: (!request.model.is_empty()).then(|| request.model.clone()),
                 signal: signal.to_string(),
                 candidates,
                 input: request.input,
@@ -299,7 +302,9 @@ fn merge(target: &mut Totals, other: &Totals) {
     target.cache_write_5m += other.cache_write_5m;
     target.cache_write_1h += other.cache_write_1h;
     target.cache_read += other.cache_read;
-    target.cost_usd += other.cost_usd;
+    if let Some(value) = other.cost_usd {
+        target.cost_usd = Some(target.cost_usd.unwrap_or(0.0) + value);
+    }
     target.unpriced |= other.unpriced;
 }
 
@@ -315,7 +320,7 @@ fn by(rows: &[ReportRow], grouping: &str) -> Result<String> {
                 .as_ref()
                 .map(|title| format!("{title} [{}]", row.session))
                 .unwrap_or_else(|| row.session.clone()),
-            "model" => row.model.clone(),
+            "model" => row.model.clone().unwrap_or_else(|| "—".into()),
             "day" => row.day.clone(),
             _ => bail!("--by must be profile, workspace, project, session, model, or day"),
         };
@@ -959,7 +964,7 @@ mod tests {
             project: "(unattributed)".into(),
             session: "sample".into(),
             title: None,
-            model: "claude-sonnet-5".into(),
+            model: Some("claude-sonnet-5".into()),
             signal: "none".into(),
             candidates: vec![
                 "unresolved label 'unknown'".into(),

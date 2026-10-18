@@ -19,6 +19,7 @@ pub struct Hourly {
 pub struct Bucket {
     pub profile: String,
     pub hour: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     pub speed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +194,9 @@ pub fn window<'a>(
     let mut amount = Amount::default();
     for b in rows.filter(|b| b.hour >= start && b.hour < now) {
         amount.tokens += b.tokens().iter().sum::<u64>();
+        if b.model.is_empty() {
+            continue;
+        }
         let (list, spend) = billing::price(
             &b.model,
             b.speed.as_deref(),

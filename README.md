@@ -179,7 +179,7 @@ Codex sessions are read from `sessions/` and `archived_sessions/` under each Cod
 
 A model can have a second price card for long prompts; a rollup row classified under another rate table shows `$*` until the next `cswitch usage refresh`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
 
-Antigravity quota is separate from transcript usage. When an Antigravity account has ledger rows, `info` and the TUI show today, 7-day and 30-day token totals only. Its `30D $` cell stays `—`; Antigravity transcripts do not name the model for each step, so no dollar amount is inferred.
+Antigravity quota is separate from transcript usage. `cswitch usage` reads model steps from both `~/.gemini/antigravity-cli/brain/` and `~/.gemini/antigravity/brain/`, including the plain home as `antigravity:default`. For each conversation it prefers `transcript_full.jsonl` and otherwise reads `transcript.jsonl`; a step appearing in both roots counts once by conversation ID and step index. Antigravity sessions contribute input, output and cache-read tokens to the ledger, with cache reads separate from input. `info` and the TUI show today, 7-day and 30-day token totals. The transcripts do not name the model per step, so Antigravity rows have no model or price, its usage dollar column shows `—`, and its `30D $` cell stays `—`.
 
 ```bash
 cswitch usage --since 30d --by project

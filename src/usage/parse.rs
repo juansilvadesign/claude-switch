@@ -20,6 +20,7 @@ pub struct Request {
     pub profile: String,
     pub session: String,
     pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     pub input: u64,
     pub output: u64,

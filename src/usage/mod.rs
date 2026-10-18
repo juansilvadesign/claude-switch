@@ -1,3 +1,6 @@
+pub mod agy;
+#[cfg(test)]
+mod agy_tests;
 pub mod attribute;
 pub mod billing;
 pub mod chats;
@@ -56,6 +59,21 @@ pub fn store(manager: &ProfileManager, override_dir: Option<PathBuf>) -> Result<
             profile: profile.name,
         });
     }
+    store.agy_sources.push(Source {
+        profile: "antigravity:default".into(),
+        directory: home.join(".gemini"),
+    });
+    for profile in manager
+        .list_profiles()?
+        .into_iter()
+        .filter(|p| p.tool == Tool::Antigravity)
+    {
+        store.agy_sources.push(Source {
+            directory: crate::agy::profile_home(&manager.profile_dir(&profile.name))
+                .join(".gemini"),
+            profile: profile.name,
+        });
+    }
     Ok(store)
 }
 
@@ -101,8 +119,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn antigravity_farm_is_never_a_usage_source() {
-        // Known-bad: a Claude-only ledger guard is replaced by Codex-or-else-Claude and walks HOME links.
+    fn antigravity_farm_is_a_usage_source_without_walking_home_links() {
+        // Known-bad: Antigravity is omitted from the ledger, or its HOME link farm is walked.
         use std::os::unix::fs::symlink;
         let temp = TempDir::new().unwrap();
         let manager = ProfileManager::with_base_dir(temp.path().join(".claude-switch")).unwrap();
@@ -128,9 +146,23 @@ mod tests {
             serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
-        let sources = store(&manager, None).unwrap().sources;
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].profile, "default");
+        let store = store(&manager, None).unwrap();
+        assert_eq!(store.sources.len(), 1);
+        assert_eq!(store.sources[0].profile, "default");
+        assert_eq!(store.agy_sources.len(), 2);
+        assert!(
+            store.agy_sources.iter().any(
+                |source| source.profile == "g" && source.directory == fake_home.join(".gemini")
+            )
+        );
+        assert!(
+            store
+                .agy_sources
+                .iter()
+                .any(|source| source.profile == "antigravity:default"
+                    && source.directory == temp.path().join(".gemini"))
+        );
+        assert_eq!(store.ingest().unwrap().new_requests, 0);
         assert_eq!(
             fs::read(outside.join("session.jsonl")).unwrap(),
             b"synthetic outside content"

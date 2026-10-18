@@ -165,6 +165,9 @@ impl Rates {
             .or_else(|| self.aliases.get(name).and_then(|id| self.models.get(id)))
     }
     pub fn prompt_tier(&self, request: &Request) -> Option<PromptTier> {
+        if request.model.is_empty() {
+            return None;
+        }
         let long_prompt = self.model_rate(&request.model)?.long_prompt.as_ref()?;
         let length = u128::from(request.input)
             + u128::from(request.cache_write_5m)
@@ -237,6 +240,9 @@ pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<bool>
 pub fn cost(request: &Request, rates: &Rates) -> Option<Cost> {
     // Known-bad: prefix matching "sonnet" or pricing fast as standard silently
     // invents a rate. Both cases must remain unpriced until explicitly listed.
+    if request.model.is_empty() {
+        return None;
+    }
     let price = rates.price_for(
         &request.model,
         request.speed.as_deref(),
